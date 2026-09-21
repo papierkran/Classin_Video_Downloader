@@ -1,21 +1,23 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 # 说明：
-# - 不再对 msedgedriver.exe 做硬依赖。
-# - 程序运行时会通过 driver_auto.py 自动检测浏览器并下载/复制匹配 driver。
-# - 这样打包时不需要预先把驱动放在项目目录里，也更适合分发。
-
+# - 使用 PySide6 替代 tkinter 作为 GUI 框架
+# - 程序运行时会通过 driver_auto.py 自动检测浏览器并下载/复制匹配 driver
 
 a = Analysis(
-    ['gui.py'],
+    ['gui_pyside.py'],
     pathex=[],
     binaries=[],
     datas=[('image', 'image')],
-    hiddenimports=['selenium', 'requests', 'webdriver_manager'],
+    hiddenimports=[
+        'selenium', 'requests', 'webdriver_manager', 'openpyxl',
+        'PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets',
+        'PySide6.QtDBus', 'PySide6.QtNetwork',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['tkinter', 'PyQt5', 'PyQt6'],
     noarchive=False,
     optimize=0,
 )

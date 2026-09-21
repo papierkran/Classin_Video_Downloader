@@ -3,6 +3,7 @@ import re
 import sys
 import time
 import csv
+import socket
 import requests
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -47,36 +48,84 @@ def format_start_time_for_filename(start_time_str):
 
 
 def generate_unique_filename(base_name, extension, save_dir):
-    index = 0
-    while True:
-        suffix = f"_{index}" if index > 0 else ""
-        filename = f"{base_name}{suffix}{extension}"
-        full_path = os.path.join(save_dir, filename)
-        if not os.path.exists(full_path):
-            return filename
-        index += 1
+    return f"{base_name}{extension}"
 
 
-def download_file(url, save_path, cookies=None, progress_callback=None):
+def download_file(url, save_path, cookies=None, progress_callback=None, timeout=60, resume=False, speed_limit=0, stop_event=None):
     headers = {}
     if cookies:
         cookie_str = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in cookies])
         headers["Cookie"] = cookie_str
+    
+    # 断点续传支持
+    existing_size = 0
+    if resume and os.path.exists(save_path):
+        existing_size = os.path.getsize(save_path)
+        headers['Range'] = f'bytes={existing_size}-'
+    
     try:
-        with requests.get(url, stream=True, headers=headers) as r:
+        with requests.get(url, stream=True, headers=headers, timeout=timeout) as r:
+            # 设置socket读超时，防止iter_content无限阻塞
+            sock = r.raw._fp.fp.raw._sock if hasattr(r.raw._fp.fp, 'raw') else None
+            if sock is None:
+                try:
+                    sock = r.raw._fp.fp._sock
+                except Exception:
+                    sock = None
+            if sock is not None:
+                sock.settimeout(timeout)
+            
+            # 检查是否支持断点续传
+            if resume and existing_size > 0 and r.status_code == 206:
+                mode = 'ab'
+                total = int(r.headers.get('Content-Length') or 0) + existing_size
+                done = existing_size
+            elif resume and existing_size > 0 and r.status_code == 200:
+                mode = 'wb'
+                total = int(r.headers.get('Content-Length') or 0)
+                done = 0
+            else:
+                mode = 'wb'
+                total = int(r.headers.get('Content-Length') or 0)
+                done = 0
+            
             r.raise_for_status()
-            total = int(r.headers.get('Content-Length') or 0)
-            done = 0
             last_t = time.time()
-            last_done = 0
-            with open(save_path, 'wb') as f:
+            last_done = done
+            speed_limit_bytes = speed_limit
+            stop_checked = time.time()
+            
+            with open(save_path, mode) as f:
                 for chunk in r.iter_content(chunk_size=1024 * 256):
                     if not chunk:
                         continue
-                    f.write(chunk)
+                    
+                    # 定期检查停止信号（每~2MB数据检查一次）
+                    now = time.time()
+                    if now - stop_checked > 2.0:
+                        stop_checked = now
+                        if stop_event is not None and getattr(stop_event, 'is_set', lambda: False)():
+                            print('收到停止信号，中断下载:', save_path)
+                            return False
+                    
+                    if speed_limit_bytes > 0:
+                        chunk_size = len(chunk)
+                        if chunk_size > speed_limit_bytes:
+                            for i in range(0, chunk_size, speed_limit_bytes):
+                                if stop_event is not None and getattr(stop_event, 'is_set', lambda: False)():
+                                    return False
+                                f.write(chunk[i:i+speed_limit_bytes])
+                                time.sleep(1)
+                        else:
+                            f.write(chunk)
+                            elapsed = time.time() - last_t
+                            if elapsed < 1 and done - last_done >= speed_limit_bytes:
+                                time.sleep(1 - elapsed)
+                    else:
+                        f.write(chunk)
+                    
                     done += len(chunk)
                     if progress_callback:
-                        now = time.time()
                         if now - last_t >= 0.5:
                             delta_bytes = done - last_done
                             delta_t = max(now - last_t, 1e-6)
@@ -89,13 +138,27 @@ def download_file(url, save_path, cookies=None, progress_callback=None):
             if progress_callback:
                 progress_callback(100, 0.0, '完成')
         return True
-    except Exception as e:
+    except requests.exceptions.Timeout:
+        print('下载超时:', save_path)
+        if progress_callback:
+            try:
+                progress_callback(0, 0.0, '下载超时')
+            except Exception:
+                pass
+        return False
+    except requests.exceptions.RequestException as e:
         print('下载出错:', e)
         if progress_callback:
             try:
                 progress_callback(0, 0.0, f'失败: {e}')
             except Exception:
                 pass
+        return False
+    except OSError as e:
+        print('文件写入出错:', e)
+        return False
+    except Exception as e:
+        print('下载异常:', e)
         return False
 
 
@@ -170,26 +233,26 @@ def get_download_info(driver, course_id, lesson_id):
                         if href and 'http' in href:
                             download_url = href
                             print(f'[DEBUG] 第{row_idx}行在td[{td_idx}]找到下载URL')
-                except:
+                except Exception:
                     pass
             
             # 按常见位置尝试获取其他字段
             if len(tds) > 4:
                 try:
                     segment_title = sanitize_filename(tds[1].text.strip())
-                except:
+                except Exception:
                     segment_title = None
             
             if len(tds) > 3:
                 try:
                     record_method = sanitize_filename(tds[3].text.strip())
-                except:
+                except Exception:
                     record_method = None
             
             if len(tds) > 4:
                 try:
                     record_time_text = tds[4].text.strip()
-                except:
+                except Exception:
                     record_time_text = None
             
             if not download_url:
@@ -250,10 +313,56 @@ def parse_cookie_string(cookie_str):
     return cookies
 
 
+def check_cookie_validity(cookie_str, log_callback=None):
+    """检查Cookie是否有效，返回(is_valid, message)"""
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+        print(msg)
+    
+    try:
+        cookies = parse_cookie_string(cookie_str)
+        if not cookies:
+            return False, 'Cookie为空'
+        
+        # 尝试访问一个需要登录的API来验证Cookie
+        headers = {
+            'Cookie': cookie_str,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        # 访问用户信息接口验证登录状态
+        test_url = 'https://console.eeo.cn/saas/school/index.html'
+        response = requests.get(test_url, headers=headers, timeout=10, allow_redirects=False)
+        
+        # 检查响应状态
+        if response.status_code == 200:
+            # 检查是否被重定向到登录页
+            if 'login' in response.text.lower() or '登录' in response.text:
+                return False, 'Cookie已过期，请重新获取'
+            return True, 'Cookie有效'
+        elif response.status_code == 302:
+            # 被重定向，可能是Cookie无效
+            location = response.headers.get('Location', '')
+            if 'login' in location.lower():
+                return False, 'Cookie已过期，请重新获取'
+            return True, 'Cookie可能有效'
+        else:
+            return False, f'验证失败，状态码: {response.status_code}'
+            
+    except requests.exceptions.Timeout:
+        return False, '验证超时，请检查网络连接'
+    except requests.exceptions.RequestException as e:
+        return False, f'验证请求失败: {e}'
+    except Exception as e:
+        return False, f'验证异常: {e}'
+
+
 def download_videos(save_dir, csv_file, cookie_str, driver_path=None, headless=False,
                     log_callback=None, pause_event=None, stop_event=None,
                     progress_callback=None, lesson_done_callback=None, driver_ref=None,
-                    course_status_callback=None, courses_override=None, max_workers=4):
+                    course_status_callback=None, courses_override=None, max_workers=4, resume=True,
+                    speed_limit=0, skip_existing=True):
     def log(msg):
         print(msg)
         try:
@@ -265,13 +374,19 @@ def download_videos(save_dir, csv_file, cookie_str, driver_path=None, headless=F
     browser, bin_path = driver_auto.detect_browser_preference()
     if not browser:
         raise RuntimeError('未检测到可用浏览器：请安装 Microsoft Edge 或 Chrome/Chromium')
+    log(f'检测到浏览器: {browser}')
     if driver_path and os.path.exists(driver_path):
         driver_exe = driver_path
+        log(f'使用指定驱动: {driver_exe}')
     else:
+        log('正在准备浏览器驱动...')
         driver_exe = driver_auto.ensure_driver(browser, base_dir=_get_base_dir())
+        log(f'驱动就绪: {driver_exe}')
+    log('正在启动浏览器...')
     driver = driver_auto.create_webdriver(browser, driver_exe, headless=headless, binary_path=bin_path)
     if driver_ref is not None:
         driver_ref['driver'] = driver
+    log('浏览器启动成功')
 
     driver.get('https://www.eeo.cn')
     cookies = parse_cookie_string(cookie_str or '')
@@ -398,6 +513,21 @@ def download_videos(save_dir, csv_file, cookie_str, driver_path=None, headless=F
             base_filename = f'{record_time}_{sanitize_filename(course_name)}_{record_method}_{sanitize_filename(segment_title)}'
             filename = generate_unique_filename(base_filename, '.mp4', folder_path)
             save_path = os.path.join(folder_path, filename)
+            
+            # 检查是否跳过已存在的文件
+            if skip_existing and os.path.exists(save_path):
+                existing_size = os.path.getsize(save_path)
+                if existing_size > 0:
+                    log(f'跳过已存在文件: {filename} ({existing_size/1024/1024:.1f}MB)')
+                    with download_lock:
+                        downloaded_count += 1
+                    if progress_callback:
+                        try:
+                            progress_callback(len(courses), course_index, course, idx)
+                        except Exception:
+                            pass
+                    return
+            
             log(f'下载中: {save_path}')
             
             # 修复lambda闭包问题 - 将变量作为默认参数传递
@@ -413,17 +543,36 @@ def download_videos(save_dir, csv_file, cookie_str, driver_path=None, headless=F
                 return callback if progress_callback else None
             
             progress_cb_for_this_video = make_progress_callback(idx, total_videos, course)
-            
-            success = download_file(download_url, save_path, cookies=cookies,
-                                    progress_callback=progress_cb_for_this_video)
-            
+
+            max_retries = 3
+            success = False
+            for attempt in range(1, max_retries + 1):
+                if stop_event is not None and getattr(stop_event, 'is_set', lambda: False)():
+                    break
+                if attempt > 1:
+                    log(f'重试下载 ({attempt}/{max_retries}): {filename}')
+                    if os.path.exists(save_path):
+                        try:
+                            os.remove(save_path)
+                        except Exception:
+                            pass
+                success = download_file(download_url, save_path, cookies=cookies,
+                                        progress_callback=progress_cb_for_this_video, 
+                                        resume=resume, speed_limit=speed_limit,
+                                        stop_event=stop_event)
+                if success:
+                    break
+                if attempt < max_retries:
+                    log(f'下载失败，3秒后重试: {filename}')
+                    time.sleep(3)
+
             with download_lock:
                 if success:
                     downloaded_count += 1
                     log(f'下载成功: {save_path}')
                 else:
                     failed_count += 1
-                    log(f'下载失败: {save_path}')
+                    log(f'下载失败 (已重试{max_retries}次): {save_path}')
                 if progress_callback:
                     try:
                         progress_callback(len(courses), course_index, course, idx)

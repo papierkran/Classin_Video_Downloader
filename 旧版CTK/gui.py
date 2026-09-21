@@ -11,6 +11,7 @@ import sys
 import time
 
 import videodownloader
+import driver_auto
 from tkinter import ttk
 
 
@@ -75,6 +76,54 @@ class App:
             except Exception:
                 pass
 
+    def show_notification(self, title, message):
+        """显示系统通知"""
+        try:
+            # Windows系统通知
+            if sys.platform == 'win32':
+                try:
+                    from win10toast import ToastNotifier
+                    toaster = ToastNotifier()
+                    toaster.show_toast(title, message, duration=5, threaded=True)
+                    return
+                except ImportError:
+                    pass
+            
+            # 跨平台方案：使用tkinter messagebox
+            self.root.after(0, lambda: messagebox.showinfo(title, message))
+        except Exception as e:
+            print(f'显示通知失败: {e}')
+
+    def execute_finish_action(self):
+        """执行下载完成后的操作"""
+        action = self.finish_action_var.get()
+        if action == '无操作':
+            return
+        
+        self.append_log(f'执行完成操作: {action}')
+        
+        if action == '关闭程序':
+            self.root.after(2000, self.root.destroy)
+        elif action == '休眠电脑':
+            try:
+                if sys.platform == 'win32':
+                    subprocess.run(['rundll32.exe', 'powrprof.dll,SetSuspendState', '0,1,0'], check=True)
+                else:
+                    subprocess.run(['systemctl', 'suspend'], check=True)
+            except Exception as e:
+                self.append_log(f'休眠失败: {e}')
+                messagebox.showerror('错误', f'休眠电脑失败: {e}')
+        elif action == '关机':
+            try:
+                if sys.platform == 'win32':
+                    subprocess.run(['shutdown', '/s', '/t', '60'], check=True)
+                    messagebox.showinfo('提示', '电脑将在60秒后关机，如需取消请运行 shutdown /a')
+                else:
+                    subprocess.run(['shutdown', '-h', '+1'], check=True)
+            except Exception as e:
+                self.append_log(f'关机失败: {e}')
+                messagebox.showerror('错误', f'关机失败: {e}')
+
     def __init__(self, root):
         self.root = root
         root.title('ClassIn 视频下载器')
@@ -87,7 +136,7 @@ class App:
         self.success_count = 0
         self.fail_count = 0
         self._is_downloading = False
-        self._check_done_id = None
+        self._download_done = False
 
         main = tk.Frame(root, bg=BG_COLOR, padx=16, pady=12)
         main.pack(fill=tk.BOTH, expand=True)
@@ -106,7 +155,11 @@ class App:
         _make_label(config_card, '浏览器驱动').grid(row=0, column=0, sticky='w', pady=(0, 4))
         self.driver_entry = _make_entry(config_card, width=50)
         self.driver_entry.grid(row=0, column=1, padx=(10, 6), pady=(0, 4), sticky='we')
-        _make_btn(config_card, '浏览', self.browse_driver, style='secondary').grid(row=0, column=2, pady=(0, 4))
+        driver_btn_frame = tk.Frame(config_card, bg=CARD_BG)
+        driver_btn_frame.grid(row=0, column=2, pady=(0, 4), sticky='w')
+        _make_btn(driver_btn_frame, '浏览', self.browse_driver, style='secondary').pack(side=tk.LEFT)
+        _make_btn(driver_btn_frame, '自动检测驱动', self.auto_detect_driver, style='secondary').pack(side=tk.LEFT, padx=(4, 0))
+        _make_btn(driver_btn_frame, '更新驱动', self.update_driver, style='secondary').pack(side=tk.LEFT, padx=(4, 0))
 
         _make_label(config_card, '保存目录').grid(row=1, column=0, sticky='w', pady=4)
         self.save_entry = _make_entry(config_card, width=50)
@@ -120,17 +173,42 @@ class App:
 
         _make_label(config_card, 'Cookie').grid(row=3, column=0, sticky='nw', pady=(4, 0))
         self.cookie_text = tk.Text(config_card, height=3, width=50, font=('Consolas', 9),
-                                   relief='flat', highlightthickness=1, highlightbackground=BORDER_COLOR,
-                                   highlightcolor=ACCENT, bd=0, bg='#fff', fg=TEXT_COLOR,
-                                   insertbackground=ACCENT, wrap=tk.WORD)
+                                    relief='flat', highlightthickness=1, highlightbackground=BORDER_COLOR,
+                                    highlightcolor=ACCENT, bd=0, bg='#fff', fg=TEXT_COLOR,
+                                    insertbackground=ACCENT, wrap=tk.WORD)
         self.cookie_text.grid(row=3, column=1, padx=(10, 6), pady=4, sticky='we')
-        _make_btn(config_card, '获取Cookie', self.get_cookie, style='secondary').grid(row=3, column=2, pady=4, sticky='n')
+        cookie_btn_frame = tk.Frame(config_card, bg=CARD_BG)
+        cookie_btn_frame.grid(row=3, column=2, pady=4, sticky='n')
+        _make_btn(cookie_btn_frame, '获取Cookie', self.get_cookie, style='secondary').pack(side=tk.LEFT)
+        _make_btn(cookie_btn_frame, '验证Cookie', self.verify_cookie, style='secondary').pack(side=tk.LEFT, padx=(4, 0))
 
         _make_label(config_card, '下载线程数').grid(row=4, column=0, sticky='w', pady=4)
         self.threads_entry = _make_entry(config_card, width=50)
         self.threads_entry.grid(row=4, column=1, padx=(10, 6), pady=4, sticky='we')
         self.threads_entry.insert(0, '4')
         tk.Label(config_card, text='(1-8)', fg=TEXT_MUTED, font=('Microsoft YaHei UI', 9)).grid(row=4, column=2, pady=4, sticky='w', padx=6)
+
+        _make_label(config_card, '速度限制').grid(row=5, column=0, sticky='w', pady=4)
+        speed_frame = tk.Frame(config_card, bg=CARD_BG)
+        speed_frame.grid(row=5, column=1, padx=(10, 6), pady=4, sticky='we')
+        self.speed_limit_var = tk.StringVar(value='不限制')
+        speed_options = ['不限制', '1 MB/s', '2 MB/s', '5 MB/s', '10 MB/s']
+        speed_combo = ttk.Combobox(speed_frame, textvariable=self.speed_limit_var, values=speed_options, width=10, state='readonly')
+        speed_combo.pack(side=tk.LEFT)
+        tk.Label(config_card, text='(限制单个视频下载速度)', fg=TEXT_MUTED, font=('Microsoft YaHei UI', 9)).grid(row=5, column=2, pady=4, sticky='w', padx=6)
+
+        _make_label(config_card, '完成操作').grid(row=6, column=0, sticky='w', pady=4)
+        self.finish_action_var = tk.StringVar(value='无操作')
+        finish_options = ['无操作', '关闭程序', '休眠电脑', '关机']
+        finish_combo = ttk.Combobox(config_card, textvariable=self.finish_action_var, values=finish_options, width=10, state='readonly')
+        finish_combo.grid(row=6, column=1, padx=(10, 6), pady=4, sticky='w')
+        tk.Label(config_card, text='(下载全部完成后执行)', fg=TEXT_MUTED, font=('Microsoft YaHei UI', 9)).grid(row=6, column=2, pady=4, sticky='w', padx=6)
+
+        self.skip_existing_var = tk.BooleanVar(value=True)
+        skip_check = tk.Checkbutton(config_card, text='跳过已存在的文件', variable=self.skip_existing_var,
+                                     bg=CARD_BG, fg=TEXT_COLOR, font=('Microsoft YaHei UI', 10),
+                                     selectcolor=ACCENT, activebackground=CARD_BG)
+        skip_check.grid(row=7, column=1, padx=(10, 6), pady=4, sticky='w')
 
         config_card.columnconfigure(1, weight=1)
 
@@ -144,6 +222,12 @@ class App:
         self.pause_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.stop_btn = _make_btn(action_frame, '停止', self.stop_download, style='danger')
         self.stop_btn.pack(side=tk.LEFT)
+        
+        # 配置导入/导出按钮
+        config_btn_frame = tk.Frame(action_frame, bg=BG_COLOR)
+        config_btn_frame.pack(side=tk.RIGHT)
+        _make_btn(config_btn_frame, '导出配置', self.export_config, style='secondary').pack(side=tk.LEFT, padx=(0, 6))
+        _make_btn(config_btn_frame, '导入配置', self.import_config, style='secondary').pack(side=tk.LEFT)
 
         progress_frame = tk.Frame(main, bg=BG_COLOR)
         progress_frame.pack(fill=tk.X, pady=(0, 6))
@@ -176,8 +260,35 @@ class App:
 
         list_frame = tk.Frame(main, bg=BG_COLOR)
         list_frame.pack(fill=tk.BOTH, expand=True)
-        _make_label(list_frame, '任务列表').pack(anchor='w', pady=(0, 4))
-        table_card = tk.Frame(list_frame, bg=CARD_BG, relief='flat')
+        list_header = tk.Frame(list_frame, bg=BG_COLOR)
+        list_header.pack(fill=tk.X, pady=(0, 4))
+        _make_label(list_header, '任务列表').pack(side=tk.LEFT)
+        
+        # 排序和筛选控件
+        filter_frame = tk.Frame(list_header, bg=BG_COLOR)
+        filter_frame.pack(side=tk.RIGHT)
+        
+        _make_label(filter_frame, '排序:').pack(side=tk.LEFT, padx=(0, 4))
+        self.sort_var = tk.StringVar(value='默认')
+        sort_options = ['默认', '班级ID', '课堂ID', '开课时间', '状态']
+        sort_combo = ttk.Combobox(filter_frame, textvariable=self.sort_var, values=sort_options, width=8, state='readonly')
+        sort_combo.pack(side=tk.LEFT, padx=(0, 4))
+        sort_combo.bind('<<ComboboxSelected>>', self.on_sort_change)
+        
+        _make_label(filter_frame, '筛选:').pack(side=tk.LEFT, padx=(10, 4))
+        self.filter_var = tk.StringVar(value='全部')
+        filter_options = ['全部', '待下载', '下载中', '已完成', '失败']
+        filter_combo = ttk.Combobox(filter_frame, textvariable=self.filter_var, values=filter_options, width=8, state='readonly')
+        filter_combo.pack(side=tk.LEFT)
+        filter_combo.bind('<<ComboboxSelected>>', self.on_filter_change)
+        
+        # 使用PanedWindow分割任务列表和日志区域
+        paned = ttk.PanedWindow(list_frame, orient=tk.VERTICAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+        
+        # 任务列表区域
+        table_frame = tk.Frame(paned, bg=BG_COLOR)
+        table_card = tk.Frame(table_frame, bg=CARD_BG, relief='flat')
         table_card.pack(fill=tk.BOTH, expand=True)
         table_card.config(highlightbackground=BORDER_COLOR, highlightthickness=1)
 
@@ -206,23 +317,30 @@ class App:
         self.tree.tag_configure('success', background='#D1E7DD')
         self.tree.tag_configure('failed', background='#F8D7DA')
 
-        table_actions = tk.Frame(list_frame, bg=BG_COLOR)
+        table_actions = tk.Frame(table_frame, bg=BG_COLOR)
         table_actions.pack(fill=tk.X, pady=(6, 6))
         _make_btn(table_actions, '导入CSV/XLSX', self.import_table_file, style='secondary').pack(side=tk.LEFT, padx=(0, 6))
         _make_btn(table_actions, '新增行', self.add_row_dialog, style='secondary').pack(side=tk.LEFT, padx=(0, 6))
         _make_btn(table_actions, '编辑行', self.edit_selected_row_dialog, style='secondary').pack(side=tk.LEFT, padx=(0, 6))
         _make_btn(table_actions, '删除行', self.delete_selected_rows, style='danger').pack(side=tk.LEFT)
+        
+        paned.add(table_frame, weight=2)
 
-        log_frame = tk.Frame(list_frame, bg=BG_COLOR)
-        log_frame.pack(fill=tk.BOTH, expand=True)
-        _make_label(log_frame, '任务日志').pack(anchor='w', pady=(0, 4))
+        # 日志区域
+        log_frame = tk.Frame(paned, bg=BG_COLOR)
+        log_header = tk.Frame(log_frame, bg=BG_COLOR)
+        log_header.pack(fill=tk.X, pady=(0, 4))
+        _make_label(log_header, '任务日志').pack(side=tk.LEFT)
+        _make_btn(log_header, '导出日志', self.export_log, style='secondary').pack(side=tk.RIGHT)
         log_card = tk.Frame(log_frame, bg=CARD_BG, relief='flat')
         log_card.pack(fill=tk.BOTH, expand=True)
         log_card.config(highlightbackground=BORDER_COLOR, highlightthickness=1)
         self.log_area = ScrolledText(log_card, height=8, width=80, state='disabled',
-                                     font=('Consolas', 9), bg='#fafafa', fg=TEXT_COLOR,
-                                     relief='flat', padx=10, pady=8, wrap=tk.WORD)
+                                      font=('Consolas', 9), bg='#fafafa', fg=TEXT_COLOR,
+                                      relief='flat', padx=10, pady=8, wrap=tk.WORD)
         self.log_area.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        
+        paned.add(log_frame, weight=1)
 
         self.load_config()
         self.auto_load_videodata_folder()
@@ -233,6 +351,72 @@ class App:
         if f:
             self.driver_entry.delete(0, tk.END)
             self.driver_entry.insert(0, f)
+
+    def auto_detect_driver(self):
+        base_dir = _get_base_dir()
+        self.append_log('正在检测浏览器...')
+        browser, bin_path = driver_auto.detect_browser_preference()
+        if not browser:
+            messagebox.showerror('错误', '未检测到 Microsoft Edge 或 Chrome 浏览器，请手动指定驱动路径。')
+            return
+        self.append_log(f'检测到浏览器: {browser} ({bin_path})')
+
+        default_name = 'msedgedriver.exe' if browser == 'edge' else 'chromedriver.exe'
+        existing = os.path.join(base_dir, default_name)
+        if os.path.exists(existing):
+            self.driver_entry.delete(0, tk.END)
+            self.driver_entry.insert(0, existing)
+            self.save_config(silent=True)
+            self.append_log(f'已存在驱动: {existing}')
+            messagebox.showinfo('成功', f'已检测到驱动文件:\n{existing}')
+            return
+
+        def do_download():
+            try:
+                self.append_log(f'正在下载 {browser} 驱动，请稍候...')
+                driver_path = driver_auto.ensure_driver(browser, base_dir=base_dir)
+                if driver_path and os.path.exists(driver_path):
+                    self.root.after(0, lambda: self.driver_entry.delete(0, tk.END))
+                    self.root.after(0, lambda: self.driver_entry.insert(0, driver_path))
+                    self.root.after(0, lambda: self.save_config(silent=True))
+                    self.append_log(f'驱动已就绪: {driver_path}')
+                    self.root.after(0, lambda: messagebox.showinfo('成功', f'驱动已下载到:\n{driver_path}'))
+                else:
+                    self.append_log('驱动下载失败')
+                    self.root.after(0, lambda: messagebox.showerror('错误', '驱动下载失败，请手动指定驱动路径。'))
+            except Exception as e:
+                self.append_log(f'驱动下载异常: {e}')
+                self.root.after(0, lambda e=e: messagebox.showerror('错误', f'驱动下载失败: {e}\n请手动指定驱动路径。'))
+
+        threading.Thread(target=do_download, daemon=True).start()
+
+    def update_driver(self):
+        base_dir = _get_base_dir()
+        self.append_log('正在检测浏览器...')
+        browser, bin_path = driver_auto.detect_browser_preference()
+        if not browser:
+            messagebox.showerror('错误', '未检测到 Microsoft Edge 或 Chrome 浏览器。')
+            return
+        self.append_log(f'检测到浏览器: {browser} ({bin_path})')
+
+        def do_update():
+            try:
+                self.append_log(f'正在下载最新 {browser} 驱动，请稍候...')
+                driver_path = driver_auto.ensure_driver(browser, base_dir=base_dir)
+                if driver_path and os.path.exists(driver_path):
+                    self.root.after(0, lambda: self.driver_entry.delete(0, tk.END))
+                    self.root.after(0, lambda: self.driver_entry.insert(0, driver_path))
+                    self.root.after(0, lambda: self.save_config(silent=True))
+                    self.append_log(f'驱动已更新: {driver_path}')
+                    self.root.after(0, lambda: messagebox.showinfo('成功', f'驱动已更新到最新版本:\n{driver_path}'))
+                else:
+                    self.append_log('驱动下载失败')
+                    self.root.after(0, lambda: messagebox.showerror('错误', '驱动下载失败，请手动指定驱动路径。'))
+            except Exception as e:
+                self.append_log(f'驱动更新异常: {e}')
+                self.root.after(0, lambda e=e: messagebox.showerror('错误', f'驱动更新失败: {e}\n请手动指定驱动路径。'))
+
+        threading.Thread(target=do_update, daemon=True).start()
 
     def browse_save(self):
         d = filedialog.askdirectory()
@@ -253,7 +437,10 @@ class App:
             'save_dir': self.save_entry.get().strip(),
             'csv_file': self.csv_entry.get().strip(),
             'cookie': self.cookie_text.get('1.0', tk.END).strip(),
-            'max_workers': self.threads_entry.get().strip() or '4'
+            'max_workers': self.threads_entry.get().strip() or '4',
+            'speed_limit': self.speed_limit_var.get(),
+            'finish_action': self.finish_action_var.get(),
+            'skip_existing': self.skip_existing_var.get()
         }
         try:
             if os.path.exists(CONFIG_PATH):
@@ -288,8 +475,68 @@ class App:
                 self.cookie_text.insert('1.0', cfg.get('cookie', ''))
                 self.threads_entry.delete(0, tk.END)
                 self.threads_entry.insert(0, cfg.get('max_workers', '4'))
+                self.speed_limit_var.set(cfg.get('speed_limit', '不限制'))
+                self.finish_action_var.set(cfg.get('finish_action', '无操作'))
+                self.skip_existing_var.set(cfg.get('skip_existing', True))
             except Exception:
                 pass
+
+    def export_config(self):
+        """导出配置到文件"""
+        try:
+            cfg = {
+                'driver_path': self.driver_entry.get().strip(),
+                'save_dir': self.save_entry.get().strip(),
+                'csv_file': self.csv_entry.get().strip(),
+                'cookie': self.cookie_text.get('1.0', tk.END).strip(),
+                'max_workers': self.threads_entry.get().strip() or '4'
+            }
+            
+            default_filename = f'配置备份_{time.strftime("%Y%m%d_%H%M%S")}.json'
+            
+            f = filedialog.asksaveasfilename(
+                defaultextension='.json',
+                filetypes=[('JSON文件', '*.json'), ('所有文件', '*.*')],
+                initialfile=default_filename
+            )
+            
+            if f:
+                with open(f, 'w', encoding='utf-8') as file:
+                    json.dump(cfg, file, ensure_ascii=False, indent=2)
+                messagebox.showinfo('成功', f'配置已导出到:\n{f}')
+                self.append_log(f'配置已导出: {f}')
+        except Exception as e:
+            messagebox.showerror('错误', f'导出配置失败: {e}')
+            self.append_log(f'导出配置失败: {e}')
+
+    def import_config(self):
+        """从文件导入配置"""
+        try:
+            f = filedialog.askopenfilename(
+                filetypes=[('JSON文件', '*.json'), ('所有文件', '*.*')]
+            )
+            
+            if f:
+                with open(f, 'r', encoding='utf-8') as file:
+                    cfg = json.load(file)
+                
+                # 更新界面
+                self.driver_entry.delete(0, tk.END)
+                self.driver_entry.insert(0, cfg.get('driver_path', ''))
+                self.save_entry.delete(0, tk.END)
+                self.save_entry.insert(0, cfg.get('save_dir', ''))
+                self.csv_entry.delete(0, tk.END)
+                self.csv_entry.insert(0, cfg.get('csv_file', ''))
+                self.cookie_text.delete('1.0', tk.END)
+                self.cookie_text.insert('1.0', cfg.get('cookie', ''))
+                self.threads_entry.delete(0, tk.END)
+                self.threads_entry.insert(0, cfg.get('max_workers', '4'))
+                
+                messagebox.showinfo('成功', f'配置已从文件导入:\n{f}')
+                self.append_log(f'配置已导入: {f}')
+        except Exception as e:
+            messagebox.showerror('错误', f'导入配置失败: {e}')
+            self.append_log(f'导入配置失败: {e}')
 
     def auto_load_videodata_folder(self):
         folder = os.path.join(_get_base_dir(), 'videodata')
@@ -426,6 +673,64 @@ class App:
         for iid in sel:
             self.tree.delete(iid)
 
+    def on_sort_change(self, event=None):
+        """排序变更回调"""
+        sort_key = self.sort_var.get()
+        if sort_key == '默认':
+            return
+        
+        # 获取所有项目
+        items = []
+        for iid in self.tree.get_children():
+            values = self.tree.item(iid, 'values')
+            items.append((iid, values))
+        
+        # 根据排序键进行排序
+        if sort_key == '班级ID':
+            items.sort(key=lambda x: x[1][0] if x[1][0] else '')
+        elif sort_key == '课堂ID':
+            items.sort(key=lambda x: x[1][1] if x[1][1] else '')
+        elif sort_key == '开课时间':
+            items.sort(key=lambda x: x[1][4] if x[1][4] else '')
+        elif sort_key == '状态':
+            status_order = {'pending': 0, 'downloading': 1, 'success': 2, 'failed': 3}
+            items.sort(key=lambda x: status_order.get(x[1][5], 4))
+        
+        # 重新排列项目
+        for index, (iid, values) in enumerate(items):
+            self.tree.move(iid, '', index)
+        
+        self.append_log(f'任务列表已按 {sort_key} 排序')
+
+    def on_filter_change(self, event=None):
+        """筛选变更回调"""
+        filter_key = self.filter_var.get()
+        
+        # 显示所有项目
+        for iid in self.tree.get_children():
+            self.tree.reattach(iid, '', 'end')
+        
+        if filter_key == '全部':
+            return
+        
+        # 根据筛选条件隐藏项目
+        filter_map = {
+            '待下载': 'pending',
+            '下载中': 'downloading',
+            '已完成': 'success',
+            '失败': 'failed'
+        }
+        
+        target_status = filter_map.get(filter_key)
+        if target_status:
+            for iid in self.tree.get_children():
+                values = self.tree.item(iid, 'values')
+                status = values[5] if len(values) > 5 else ''
+                if status != target_status:
+                    self.tree.detach(iid)
+        
+        self.append_log(f'任务列表已筛选: {filter_key}')
+
     def set_row_status(self, course_index, status, message=''):
         iids = self.tree.get_children()
         if course_index <= 0 or course_index > len(iids):
@@ -449,16 +754,47 @@ class App:
         self.log_area.see(tk.END)
         self.log_area.configure(state='disabled')
 
+    def export_log(self):
+        """导出日志到文件"""
+        try:
+            log_content = self.log_area.get('1.0', tk.END).strip()
+            if not log_content:
+                messagebox.showwarning('提示', '日志内容为空')
+                return
+            
+            # 生成默认文件名
+            default_filename = f'下载日志_{time.strftime("%Y%m%d_%H%M%S")}.txt'
+            
+            f = filedialog.asksaveasfilename(
+                defaultextension='.txt',
+                filetypes=[('文本文件', '*.txt'), ('所有文件', '*.*')],
+                initialfile=default_filename
+            )
+            
+            if f:
+                with open(f, 'w', encoding='utf-8') as file:
+                    file.write(log_content)
+                messagebox.showinfo('成功', f'日志已导出到:\n{f}')
+                self.append_log(f'日志已导出: {f}')
+        except Exception as e:
+            messagebox.showerror('错误', f'导出日志失败: {e}')
+            self.append_log(f'导出日志失败: {e}')
+
     def flush_log_queue(self):
         try:
             while True:
                 msg = self.log_q.get_nowait()
-                if isinstance(msg, tuple) and msg and msg[0] == '__DONE__':
-                    continue
                 self.append_log(msg)
         except queue.Empty:
             pass
-        self.root.after(200, self.flush_log_queue)
+        if getattr(self, '_download_done', False) and self._is_downloading:
+            self.start_btn.config(state='normal')
+            self.save_btn.config(state='normal')
+            if hasattr(self, 'driver_ref'):
+                self.driver_ref.clear()
+            self._is_downloading = False
+        interval = 100 if self._is_downloading else 1000
+        self.root.after(interval, self.flush_log_queue)
 
     def toggle_pause(self):
         if not hasattr(self, 'pause_event'):
@@ -480,11 +816,7 @@ class App:
 
         self.stop_event.set()
         self.append_log('已发送停止信号，等待线程退出...')
-        
-        # 取消check_done的定时回调
-        if hasattr(self, '_check_done_id') and self._check_done_id is not None:
-            self.root.after_cancel(self._check_done_id)
-            self._check_done_id = None
+        self._download_done = True
         
         # 重置暂停事件状态
         if hasattr(self, 'pause_event'):
@@ -568,8 +900,40 @@ class App:
 
     def get_cookie(self):
         cookie_file = os.path.join(tempfile.gettempdir(), 'classin_cookies.json')
-        driver_path = self.driver_entry.get().strip() or os.path.join(_get_base_dir(), 'msedgedriver.exe')
-        script = f'''import json\nimport time\nfrom selenium import webdriver\nfrom selenium.webdriver.edge.service import Service\nservice = Service(executable_path=r"{driver_path}")\ndriver = webdriver.Edge(service=service)\ndriver.get("https://www.eeo.cn/cn/login")\nprint("请登录后等待保存 cookie")\ntime.sleep(40)\ncookies = driver.get_cookies()\ndriver.quit()\nwith open(r"{cookie_file}", "w", encoding="utf-8") as f:\n    json.dump(cookies, f, ensure_ascii=False)\nprint("cookie 已保存")\n'''
+        driver_path = self.driver_entry.get().strip() or None
+
+        browser, bin_path = driver_auto.detect_browser_preference()
+        if not browser:
+            messagebox.showerror('错误', '未检测到 Microsoft Edge 或 Chrome 浏览器，请先点击"自动检测驱动"。')
+            return
+
+        base_dir = _get_base_dir()
+        default_name = 'msedgedriver.exe' if browser == 'edge' else 'chromedriver.exe'
+        if not driver_path or not os.path.exists(driver_path):
+            driver_path = os.path.join(base_dir, default_name)
+        if not os.path.exists(driver_path):
+            messagebox.showwarning('提示', '未找到驱动文件，请先点击"自动检测驱动"下载驱动。')
+            return
+
+        import_str = 'from selenium.webdriver.edge.service import Service' if browser == 'edge' else 'from selenium.webdriver.chrome.service import Service'
+        driver_class = 'webdriver.Edge' if browser == 'edge' else 'webdriver.Chrome'
+
+        script = (
+            f'import json\n'
+            f'import time\n'
+            f'from selenium import webdriver\n'
+            f'{import_str}\n'
+            f'service = Service(executable_path=r"{driver_path}")\n'
+            f'driver = {driver_class}(service=service)\n'
+            f'driver.get("https://www.eeo.cn/cn/login")\n'
+            f'print("请登录后等待保存 cookie")\n'
+            f'time.sleep(40)\n'
+            f'cookies = driver.get_cookies()\n'
+            f'driver.quit()\n'
+            f'with open(r"{cookie_file}", "w", encoding="utf-8") as f:\n'
+            f'    json.dump(cookies, f, ensure_ascii=False)\n'
+            f'print("cookie 已保存")\n'
+        )
         tmp_py = os.path.join(tempfile.gettempdir(), 'get_cookie_tmp.py')
         with open(tmp_py, 'w', encoding='utf-8') as f:
             f.write(script)
@@ -577,7 +941,7 @@ class App:
             subprocess.Popen([sys.executable, tmp_py], creationflags=subprocess.CREATE_NEW_CONSOLE if hasattr(subprocess, 'CREATE_NEW_CONSOLE') else 0)
         except Exception:
             subprocess.Popen([sys.executable, tmp_py])
-        messagebox.showinfo('操作提示', '已弹出浏览器，请在新窗口登录后等待自动保存 Cookie。登录完成后点击“导入Cookie”按钮。')
+        messagebox.showinfo('操作提示', '已弹出浏览器，请在新窗口登录后等待自动保存 Cookie。登录完成后点击"导入Cookie"按钮。')
 
         def import_cookie():
             if os.path.exists(cookie_file):
@@ -600,23 +964,108 @@ class App:
         tk.Label(import_win, text='登录完成后点击下方按钮导入 Cookie：', font=('Microsoft YaHei UI', 10), fg=TEXT_COLOR, bg=BG_COLOR).pack(padx=24, pady=20)
         _make_btn(import_win, '导入 Cookie', import_cookie, style='primary').pack(pady=(0, 20))
 
+    def verify_cookie(self):
+        """验证Cookie是否有效"""
+        cookie = self.cookie_text.get('1.0', tk.END).strip()
+        if not cookie:
+            messagebox.showwarning('提示', '请先输入或获取Cookie')
+            return
+        
+        self.append_log('正在验证Cookie有效性...')
+        
+        def do_verify():
+            try:
+                is_valid, message = videodownloader.check_cookie_validity(cookie, log_callback=self.append_log)
+                if is_valid:
+                    self.root.after(0, lambda: messagebox.showinfo('验证结果', f'Cookie有效！\n{message}'))
+                    self.root.after(0, lambda: self.append_log('Cookie验证通过'))
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning('验证结果', f'Cookie无效！\n{message}'))
+                    self.root.after(0, lambda: self.append_log(f'Cookie验证失败: {message}'))
+            except Exception as e:
+                self.root.after(0, lambda e=e: messagebox.showerror('错误', f'验证过程出错: {e}'))
+                self.root.after(0, lambda e=e: self.append_log(f'Cookie验证异常: {e}'))
+        
+        threading.Thread(target=do_verify, daemon=True).start()
+
+    def parse_speed_limit(self, speed_str):
+        """解析速度限制字符串，返回每秒字节数"""
+        if speed_str == '不限制':
+            return 0
+        try:
+            if 'MB/s' in speed_str:
+                mbps = float(speed_str.replace(' MB/s', ''))
+                return int(mbps * 1024 * 1024)
+        except Exception:
+            pass
+        return 0
+
+    def validate_inputs(self):
+        """验证输入参数"""
+        errors = []
+        
+        driver_path = self.driver_entry.get().strip()
+        if driver_path and not os.path.exists(driver_path):
+            errors.append('指定的驱动文件不存在')
+        
+        save_dir = self.save_entry.get().strip()
+        if save_dir and len(save_dir) > 260:
+            errors.append('保存目录路径过长')
+        
+        csv_file = self.csv_entry.get().strip()
+        if csv_file and not os.path.exists(csv_file):
+            errors.append('指定的数据文件不存在')
+        
+        cookie = self.cookie_text.get('1.0', tk.END).strip()
+        if not cookie:
+            errors.append('Cookie不能为空')
+        
+        max_workers_str = self.threads_entry.get().strip()
+        if max_workers_str:
+            try:
+                max_workers = int(max_workers_str)
+                if max_workers < 1 or max_workers > 8:
+                    errors.append('下载线程数必须在1-8之间')
+            except ValueError:
+                errors.append('下载线程数必须是数字')
+        
+        return errors
+
     def start_download(self):
+        print('[DEBUG] start_download 被调用')
         # 防止多次快速点击导致多个下载同时进行
         if hasattr(self, '_is_downloading') and self._is_downloading:
             messagebox.showwarning('提示', '下载正在进行中，请勿重复点击')
             return
         
+        # 验证输入
+        print('[DEBUG] 验证输入...')
+        errors = self.validate_inputs()
+        if errors:
+            messagebox.showerror('输入错误', '请修正以下问题:\n' + '\n'.join(errors))
+            return
+        
+        print('[DEBUG] 读取配置...')
         driver_path = self.driver_entry.get().strip() or None
         save_dir = self.save_entry.get().strip() or None
         csv_file = self.csv_entry.get().strip() or None
         cookie = self.cookie_text.get('1.0', tk.END).strip() or ''
         max_workers_str = self.threads_entry.get().strip() or '4'
+        speed_limit = self.parse_speed_limit(self.speed_limit_var.get())
+        skip_existing = self.skip_existing_var.get()
+        finish_action = self.finish_action_var.get()
+        
         try:
             max_workers = max(1, min(8, int(max_workers_str)))
         except ValueError:
             max_workers = 4
             self.threads_entry.delete(0, tk.END)
             self.threads_entry.insert(0, '4')
+        
+        # 验证Cookie是否为空
+        if not cookie:
+            messagebox.showwarning('提示', 'Cookie不能为空，请先获取或输入Cookie')
+            return
         
         courses_override = self.collect_courses_from_table()
         if not courses_override:
@@ -668,8 +1117,11 @@ class App:
             except Exception as e:
                 log_cb(f'记录 last_success 失败: {e}')
 
+        self._download_done = False
+
         def target():
             try:
+                print('[DEBUG] 下载线程已启动')
                 def course_status_cb(course_index, course, status, message):
                     def _apply():
                         self.set_row_status(course_index, status, message)
@@ -681,6 +1133,7 @@ class App:
                         self.update_progress(self.total_items, done, self.success_count, self.fail_count)
                     self.root.after(0, _apply)
 
+                print('[DEBUG] 调用 download_videos...')
                 videodownloader.download_videos(save_dir, csv_file, cookie,
                                                 driver_path=driver_path,
                                                 headless=True,
@@ -692,35 +1145,21 @@ class App:
                                                 driver_ref=self.driver_ref,
                                                 course_status_callback=course_status_cb,
                                                 courses_override=courses_override,
-                                                max_workers=max_workers)
+                                                max_workers=max_workers,
+                                                speed_limit=speed_limit,
+                                                skip_existing=skip_existing)
+                print('[DEBUG] download_videos 返回')
                 log_cb('全部任务完成')
             except Exception as e:
+                print(f'[DEBUG] 下载线程异常: {e}')
                 log_cb(f'下载任务异常: {e}')
             finally:
-                self.log_q.put(('__DONE__', self._download_session))
+                self._download_done = True
+                print('[DEBUG] 下载线程结束')
 
+        print('[DEBUG] 启动下载线程...')
         threading.Thread(target=target, daemon=True).start()
-
-        def check_done():
-            try:
-                while True:
-                    msg = self.log_q.get_nowait()
-                    if isinstance(msg, tuple) and msg[0] == '__DONE__':
-                        if msg[1] == self._download_session:
-                            self.start_btn.config(state='normal')
-                            self.save_btn.config(state='normal')
-                            self.driver_ref.clear()
-                            self._is_downloading = False
-                            self._check_done_id = None
-                        return
-                    self.append_log(msg)
-            except queue.Empty:
-                pass
-            # 保存定时器ID，以便后续取消
-            self._check_done_id = self.root.after(200, check_done)
-
-        self._check_done_id = None
-        self._check_done_id = self.root.after(200, check_done)
+        print('[DEBUG] 下载线程已启动，主线程继续')
 
 
 if __name__ == '__main__':

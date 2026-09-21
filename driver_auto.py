@@ -1,6 +1,8 @@
 import os
 import sys
 import subprocess
+import zipfile
+import io
 
 
 def _get_base_dir():
@@ -105,26 +107,126 @@ def _copy_to_program_dir(src_path: str, program_dir: str, dest_name: str):
         return src_path
 
 
+def _get_edge_version(binary_path: str) -> str:
+    """从 Edge 浏览器获取版本号（优先注册表）。"""
+    import re
+
+    def _is_valid_version(v: str) -> bool:
+        return bool(re.match(r'^\d+\.\d+\.\d+\.\d+$', v.strip()))
+
+    # 方案1：注册表（最可靠）
+    try:
+        import winreg
+        for root_key in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                key = winreg.OpenKey(root_key, r'Software\Microsoft\Edge\BLBeacon')
+                version, _ = winreg.QueryValueEx(key, 'version')
+                winreg.CloseKey(key)
+                if version and _is_valid_version(version):
+                    return version.strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 方案2：读取二进制文件版本信息
+    try:
+        import struct
+        with open(binary_path, 'rb') as f:
+            data = f.read()
+        # PE 文件中搜索版本模式 X.Y.Z.W
+        match = re.search(rb'(\d+\.\d+\.\d+\.\d+)', data)
+        if match:
+            candidate = match.group(1).decode('ascii')
+            if _is_valid_version(candidate):
+                return candidate
+    except Exception:
+        pass
+
+    return None
+
+
+def _download_edge_driver_direct(version: str, base_dir: str) -> str:
+    """直接从网络下载 Edge 驱动（备用方案）。"""
+    import requests
+
+    major = version.split('.')[0] if version else None
+    if not major:
+        return None
+
+    dest_name = 'msedgedriver.exe' if os.name == 'nt' else 'msedgedriver'
+    dest_path = os.path.join(base_dir, dest_name)
+
+    url = f'https://msedgedriver.azureedge.net/{version}/edgedriver_win64.zip'
+    mirrors = [
+        f'https://msedgedriver.azureedge.net/{version}/edgedriver_win64.zip',
+        f'https://npmmirror.com/mirrors/edgedriver/{version}/edgedriver_win64.zip',
+    ]
+
+    for url in mirrors:
+        try:
+            print(f'[驱动下载] 尝试: {url}')
+            resp = requests.get(url, timeout=60, stream=True)
+            resp.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                for name in zf.namelist():
+                    if name.endswith('.exe') or name == 'msedgedriver':
+                        with zf.open(name) as src, open(dest_path, 'wb') as dst:
+                            dst.write(src.read())
+                        break
+            if os.path.exists(dest_path):
+                print(f'[驱动下载] 成功: {dest_path}')
+                return dest_path
+        except Exception as e:
+            print(f'[驱动下载] 失败: {e}')
+            continue
+
+    return None
+
+
 def ensure_driver(browser: str, base_dir: str = None):
     """自动下载匹配 driver 到 base_dir，并尽量复制一份到程序目录返回。
 
-    目的：Windows + PyInstaller 下，driver 固定落在 exe 同级，方便可视化获取 cookie。
+    优先使用 webdriver_manager，失败后尝试直接下载。
     """
     base_dir = base_dir or _get_base_dir()
     os.makedirs(base_dir, exist_ok=True)
 
     if browser == "edge":
-        from webdriver_manager.microsoft import EdgeChromiumDriverManager
-        src = EdgeChromiumDriverManager(path=base_dir).install()
-        # Windows 固定叫 msedgedriver.exe；非 Windows 也用 msedgedriver
         dest_name = 'msedgedriver.exe' if os.name == 'nt' else 'msedgedriver'
-        return _copy_to_program_dir(src, base_dir, dest_name)
+
+        # 方案1：webdriver_manager
+        try:
+            from webdriver_manager.microsoft import EdgeChromiumDriverManager
+            from webdriver_manager.core.driver_cache import DriverCacheManager
+            cache = DriverCacheManager(root_dir=base_dir)
+            src = EdgeChromiumDriverManager(cache_manager=cache).install()
+            return _copy_to_program_dir(src, base_dir, dest_name)
+        except Exception as e:
+            print(f'[驱动下载] webdriver_manager 失败: {e}')
+
+        # 方案2：直接下载
+        _, bin_path = detect_browser_preference()
+        version = _get_edge_version(bin_path) if bin_path else None
+        if version:
+            print(f'[驱动下载] 检测到 Edge 版本: {version}')
+            result = _download_edge_driver_direct(version, base_dir)
+            if result:
+                return result
+
+        raise RuntimeError('Edge 驱动下载失败，请检查网络或手动指定驱动路径。')
 
     if browser == "chrome":
-        from webdriver_manager.chrome import ChromeDriverManager
-        src = ChromeDriverManager(path=base_dir).install()
-        dest_name = 'chromedriver.exe' if os.name == 'nt' else 'chromedriver'
-        return _copy_to_program_dir(src, base_dir, dest_name)
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            from webdriver_manager.core.driver_cache import DriverCacheManager
+            cache = DriverCacheManager(root_dir=base_dir)
+            src = ChromeDriverManager(cache_manager=cache).install()
+            dest_name = 'chromedriver.exe' if os.name == 'nt' else 'chromedriver'
+            return _copy_to_program_dir(src, base_dir, dest_name)
+        except Exception as e:
+            print(f'[驱动下载] Chrome driver 下载失败: {e}')
+            raise RuntimeError('Chrome 驱动下载失败，请检查网络或手动指定驱动路径。')
 
     raise ValueError(f"Unsupported browser: {browser}")
 
@@ -159,7 +261,6 @@ def create_webdriver(browser: str, driver_path: str, headless: bool = False, bin
         if binary_path:
             options.binary_location = binary_path
         if headless:
-            # Chrome headless
             try:
                 options.add_argument('--headless=new')
             except Exception:

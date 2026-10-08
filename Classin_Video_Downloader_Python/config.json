@@ -1,0 +1,22 @@
+{
+  "driver_path": "c:\\Users\\WINNAS\\Desktop\\workfold\\tools\\Classin_Video_Downloader_Python\\msedgedriver.exe",
+  "save_dir": "X:/video/4-5",
+  "csv_file": "C:/Users/WINNAS/Downloads/ClassIn平台机构课堂统计_202606292038115-6.csv",
+  "cookie": "sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%2282022576%22%2C%22first_id%22%3A%2219e7e804933726-00e6b74f0329162-4c657b58-3686400-19e7e8049342e2b%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTllN2U4MDQ5MzM3MjYtMDBlNmI3NGYwMzI5MTYyLTRjNjU3YjU4LTM2ODY0MDAtMTllN2U4MDQ5MzQyZTJiIiwiJGlkZW50aXR5X2xvZ2luX2lkIjoiODIwMjI1NzYifQ%3D%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%24identity_login_id%22%2C%22value%22%3A%2282022576%22%7D%2C%22%24device_id%22%3A%2219e7e804933726-00e6b74f0329162-4c657b58-3686400-19e7e8049342e2b%22%7D; locationArgumentLang=zh-CN; _eeos_uid=82022576; _eeos_useraccount=17373905163; _eeos_userlogo=https%3A%2F%2Fstatic.eeo.cn%2Fimages%2Fuser.png; _eeos_domain=.eeo.cn; _eeos_remember=1; _eeos_traffic=%2FQ%2BNhv7jnH8QLl2PlAgU0FJPNUpqQzSZN1heNySf%2B7CX10fC2E2e9CJrNmVwar5c2iBE4WPmahI%3D; _eeos_sub=1; _eeos_sid=72017310; _eeos_nsid=C0fnLGibET79l3%2BQsdqF0Q%3D%3D; __tk_id=966ada3c89db04bee8c09378206e4e73",
+  "max_workers": "4",
+  "speed_limit": "不限制",
+  "finish_action": "无操作",
+  "skip_existing": false,
+  "last_success": {
+    "course_id": "300279977",
+    "lesson_id": "1099885871",
+    "course_name": "课堂名称_ 26春尹老师周日初一语文班-新课程-18",
+    "class_name": "26春尹老师周日初一语文班",
+    "lesson_name": "26春尹老师周日初一语文班-新课程-18",
+    "total_videos": 4,
+    "downloaded": 4,
+    "course_row_index": 130,
+    "total_courses": 130,
+    "timestamp": "2026-06-30 10:38:00"
+  }
+}

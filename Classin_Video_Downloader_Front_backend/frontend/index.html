@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ClassIn 视频下载管理系统</title>
+  <link rel="stylesheet" href="/static/vendor/element-plus.css">
+  <link rel="stylesheet" href="/static/styles.css?v=20261009-path-clarity">
+</head>
+<body>
+<div id="app" v-cloak>
+
+  <!-- ===== 登录页 ===== -->
+  <div class="login-bg" v-if="!authed">
+    <el-card class="login-card">
+      <div class="login-logo">ClassIn 视频下载管理系统</div>
+      <el-form @submit.prevent>
+        <el-form-item>
+          <el-input v-model="loginForm.username" placeholder="用户名" size="large" @keyup.enter="doLogin"></el-input>
+        </el-form-item>
+        <el-form-item>
+          <el-input v-model="loginForm.password" type="password" placeholder="密码" size="large" show-password @keyup.enter="doLogin"></el-input>
+        </el-form-item>
+        <el-button type="primary" size="large" style="width:100%" :loading="loginLoading" @click="doLogin">登 录</el-button>
+      </el-form>
+      <div class="login-tip">默认账号 admin / admin123（首次登录后请修改）</div>
+    </el-card>
+  </div>
+
+  <!-- ===== 主框架 ===== -->
+  <div class="layout" v-else>
+    <aside class="side">
+      <div class="side-logo">📥 ClassIn 下载管理</div>
+      <div class="side-menu">
+        <div class="side-item" :class="{on: view==='dashboard'}" @click="view='dashboard'">📊 仪表盘</div>
+        <div class="side-item" :class="{on: view==='lessons'}" @click="switchLessons">📚 课堂管理</div>
+        <div class="side-item" :class="{on: view==='tasks'}" @click="switchTasks">🎬 下载任务</div>
+        <div class="side-item" :class="{on: view==='videos'}" @click="switchVideos">▶️ 视频库</div>
+        <div class="side-item" :class="{on: view==='settings'}" @click="view='settings'">⚙️ 系统设置</div>
+      </div>
+      <div class="side-foot">v1.0 前后端一体版</div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="page-title">{{ viewTitle }}</div>
+        <div class="user-area">
+          <el-dropdown @command="onUserCmd">
+            <span class="user-name">👤 {{ user.username }} <el-icon><ArrowDown /></el-icon></span>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="password">修改密码</el-dropdown-item>
+                <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+        </div>
+      </header>
+
+      <div class="content">
+
+        <!-- ===== 仪表盘 ===== -->
+        <div v-show="view==='dashboard'">
+          <div class="stat-row">
+            <div class="stat-card blue" @click="switchVideos"><div class="stat-num">{{ stats.videos_total }}</div><div class="stat-label">视频片段总数</div></div>
+            <div class="stat-card green" @click="switchVideos"><div class="stat-num">{{ stats.videos_downloaded }}</div><div class="stat-label">已下载 / 已存在</div></div>
+            <div class="stat-card red" @click="switchVideos"><div class="stat-num">{{ stats.videos_failed }}</div><div class="stat-label">视频下载失败</div></div>
+            <div class="stat-card orange"><div class="stat-num">{{ stats.tasks_running }}</div><div class="stat-label">进行中任务</div></div>
+          </div>
+          <div class="sub-text mb12">待下载或仍在处理的视频：{{ Math.max(0, stats.videos_total - stats.videos_downloaded - stats.videos_failed) }}（下载中 {{ stats.videos_downloading }}）</div>
+          <el-card shadow="never">
+            <template #header><div class="card-head">最近任务</div></template>
+            <el-table :data="stats.recent_tasks" size="large" empty-text="暂无任务，请到下载任务页创建">
+              <el-table-column prop="id" label="ID" width="70"></el-table-column>
+              <el-table-column prop="name" label="任务名称" min-width="160"></el-table-column>
+              <el-table-column label="状态" width="110">
+                <template #default="{row}"><el-tag :type="statusTag(row.status)">{{ statusZh(row.status) }}</el-tag></template>
+              </el-table-column>
+              <el-table-column label="进度" min-width="180">
+                <template #default="{row}">
+                  <el-progress :percentage="row.percent" :status="row.status==='failed'?'exception':null"></el-progress>
+                </template>
+              </el-table-column>
+              <el-table-column prop="lesson_count" label="课堂数" width="90"></el-table-column>
+              <el-table-column prop="success_count" label="成功" width="80"></el-table-column>
+              <el-table-column prop="fail_count" label="失败" width="80"></el-table-column>
+            </el-table>
+          </el-card>
+        </div>
+
+        <!-- ===== 课堂管理 ===== -->
+        <div v-show="view==='lessons'">
+          <el-card shadow="never" class="mb12">
+            <div class="toolbar">
+              <el-input v-model="lessonQuery.keyword" placeholder="搜索课堂/班级名称或ID" clearable style="width:260px" @keyup.enter="loadLessons(1)" @clear="loadLessons(1)"></el-input>
+              <el-select v-model="lessonQuery.status" placeholder="状态筛选" clearable style="width:150px" @change="loadLessons(1)">
+                <el-option label="待下载" value="pending"></el-option>
+                <el-option label="下载中" value="downloading"></el-option>
+                <el-option label="成功" value="success"></el-option>
+                <el-option label="失败" value="failed"></el-option>
+              </el-select>
+              <el-button type="primary" @click="loadLessons(1)">查询</el-button>
+              <div class="spacer"></div>
+              <el-button type="success" @click="importVisible=true">导入 CSV/XLSX</el-button>
+              <el-button type="primary" plain @click="openLessonDialog(null)">新增课堂</el-button>
+              <el-button type="danger" plain :disabled="!selectedLessons.length" @click="batchDeleteLessons">删除所选</el-button>
+              <el-button type="warning" :disabled="!selectedLessons.length" @click="createTaskFromSelection">从所选建任务</el-button>
+            </div>
+          </el-card>
+
+          <el-card shadow="never">
+            <el-table :data="lessons" v-loading="lessonLoading" @selection-change="selectedLessons=$event" size="large">
+              <el-table-column type="selection" width="48"></el-table-column>
+              <el-table-column prop="lesson_id" label="课堂ID" width="130"></el-table-column>
+              <el-table-column prop="class_name" label="班级名称" min-width="170" show-overflow-tooltip></el-table-column>
+              <el-table-column prop="lesson_name" label="课堂名称" min-width="200" show-overflow-tooltip></el-table-column>
+              <el-table-column prop="start_time" label="开课时间" width="165"></el-table-column>
+              <el-table-column label="状态" width="100">
+                <template #default="{row}">
+                  <el-tag :type="lessonStatusTag(row.status)">{{ lessonStatusZh(row.status) }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column prop="message" label="备注" min-width="130" show-overflow-tooltip></el-table-column>
+              <el-table-column label="操作" width="205" fixed="right">
+                <template #default="{row}">
+                  <el-button link type="success" :loading="lessonDownloadId===row.id" @click="downloadLesson(row)">下载</el-button>
+                  <el-button link type="primary" @click="openLessonDialog(row)">编辑</el-button>
+                  <el-button link type="danger" @click="deleteLesson(row)">删除</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+            <div class="pager">
+              <el-pagination background layout="total, prev, pager, next" :total="lessonQuery.total"
+                :page-size="lessonQuery.page_size" :current-page="lessonQuery.page"
+                @current-change="loadLessons"></el-pagination>
+            </div>
+          </el-card>
+        </div>
+
+        <!-- ===== 视频库 ===== -->
+        <div v-show="view==='videos'">
+          <el-alert class="mb12" type="info" :closable="false" title="视频库会自动收录本系统下载的视频。扫描仅用于补录服务器上已有的旧视频，扫描范围是「系统设置 → 默认下载根目录」；迁移旧视频时请把原目录完整复制到该位置并保留班级/课堂文件夹结构。"></el-alert>
+          <div v-if="settingsSaved.save_dir" class="video-scan-path">旧视频扫描目录：<code>{{ settingsSaved.save_dir }}</code></div>
+          <el-card shadow="never" class="mb12">
+            <div class="toolbar">
+              <el-input v-model="videoQuery.keyword" placeholder="搜索课堂、班级或片段名称" clearable style="width:280px" @keyup.enter="loadVideos(1)" @clear="loadVideos(1)"></el-input>
+              <el-select v-model="videoQuery.status" placeholder="视频状态" clearable style="width:150px" @change="loadVideos(1)">
+                <el-option v-for="(zh,key) in VIDEO_STATUS" :key="key" :label="zh" :value="key"></el-option>
+              </el-select>
+              <el-button type="primary" @click="loadVideos(1)">查询</el-button>
+              <div class="spacer"></div>
+              <el-button type="success" plain @click="scanVideos">扫描默认下载目录</el-button>
+              <span class="sub-text">下载完成或已跳过的视频可在线播放</span>
+            </div>
+          </el-card>
+          <el-card shadow="never">
+            <el-table :data="videos" v-loading="videoLoading" size="large">
+              <el-table-column prop="class_name" label="班级" min-width="150" show-overflow-tooltip></el-table-column>
+              <el-table-column prop="lesson_name" label="课堂" min-width="180" show-overflow-tooltip></el-table-column>
+              <el-table-column prop="title" label="视频片段" min-width="190" show-overflow-tooltip></el-table-column>
+              <el-table-column prop="record_date" label="录制日期" width="130"></el-table-column>
+              <el-table-column label="状态" width="105">
+                <template #default="{row}"><el-tag :type="videoStatusTag(row.status)">{{ videoStatusZh(row.status) }}</el-tag></template>
+              </el-table-column>
+              <el-table-column label="大小" width="100">
+                <template #default="{row}">{{ formatBytes(row.size_bytes) }}</template>
+              </el-table-column>
+              <el-table-column prop="error" label="失败原因" min-width="170" show-overflow-tooltip></el-table-column>
+              <el-table-column label="操作" width="155" fixed="right">
+                <template #default="{row}">
+                  <el-button v-if="row.status==='success'||row.status==='skipped'" link type="primary" @click="playVideo(row)">播放</el-button>
+                  <el-button v-if="row.status==='failed'" link type="warning" @click="retryVideo(row)">重试课堂</el-button>
+                  <el-button v-if="row.status==='success'||row.status==='skipped'" link type="success" @click="downloadVideo(row)">下载</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+            <div class="pager">
+              <el-pagination background layout="total, prev, pager, next" :total="videoQuery.total"
+                :page-size="videoQuery.page_size" :current-page="videoQuery.page" @current-change="loadVideos"></el-pagination>
+            </div>
+          </el-card>
+        </div>
+
+        <!-- ===== 下载任务 ===== -->
+        <div v-show="view==='tasks'">
+          <el-card shadow="never" class="mb12">
+            <div class="toolbar">
+              <el-select v-model="taskQuery.status" placeholder="状态筛选" clearable style="width:150px" @change="loadTasks(1)">
+                <el-option v-for="(zh,key) in TASK_STATUS" :label="zh" :value="key"></el-option>
+              </el-select>
+              <el-button type="primary" @click="loadTasks(1)">查询</el-button>
+              <div class="spacer"></div>
+              <el-button type="primary" @click="openTaskDialog">➕ 新建下载任务</el-button>
+            </div>
+          </el-card>
+
+          <el-card shadow="never">
+            <el-table :data="tasks" v-loading="taskLoading" size="large">
+              <el-table-column prop="id" label="ID" width="70"></el-table-column>
+              <el-table-column prop="name" label="任务名称" min-width="150" show-overflow-tooltip></el-table-column>
+              <el-table-column label="状态" width="110">
+                <template #default="{row}"><el-tag :type="statusTag(row.status)">{{ statusZh(row.status) }}</el-tag></template>
+              </el-table-column>
+              <el-table-column label="进度" min-width="200">
+                <template #default="{row}">
+                  <el-progress :percentage="row.percent" :status="row.status==='failed'?'exception':null"></el-progress>
+                  <div class="sub-text" v-if="row.status==='running' && row.current_lesson">
+                    {{ row.current_lesson }} · {{ row.speed_mbps.toFixed(2) }} MB/s
+                  </div>
+                </template>
+              </el-table-column>
+              <el-table-column label="课堂" width="140">
+                <template #default="{row}">{{ row.success_count }}/{{ row.lesson_count }} 成功 <span class="fail-num" v-if="row.fail_count">·{{ row.fail_count }}败</span></template>
+              </el-table-column>
+              <el-table-column label="操作" width="300" fixed="right">
+                <template #default="{row}">
+                  <template v-if="row.status==='created' || row.status==='failed' || row.status==='cancelled' || row.status==='success'">
+                    <el-button link type="primary" @click="taskAction(row,'start')">▶ 启动</el-button>
+                  </template>
+                  <el-button v-if="row.status==='running'" link type="warning" @click="taskAction(row,'pause')">⏸ 暂停</el-button>
+                  <el-button v-if="row.status==='paused'" link type="success" @click="taskAction(row,'resume')">▶ 继续</el-button>
+                  <el-button v-if="row.status==='running'||row.status==='paused'" link type="danger" @click="taskAction(row,'stop')">⏹ 停止</el-button>
+                  <el-button link type="info" @click="openTaskDetail(row)">详情</el-button>
+                  <el-button link type="danger" @click="deleteTask(row)">删除</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+            <div class="pager">
+              <el-pagination background layout="total, prev, pager, next" :total="taskQuery.total"
+                :page-size="taskQuery.page_size" :current-page="taskQuery.page"
+                @current-change="loadTasks"></el-pagination>
+            </div>
+          </el-card>
+        </div>
+
+        <!-- ===== 系统设置 ===== -->
+        <div v-show="view==='settings'" class="settings-grid">
+          <el-card shadow="never">
+            <template #header><div class="card-head">下载配置</div></template>
+            <el-form label-width="110px" size="large">
+              <el-form-item label="默认下载根目录">
+                <div class="path-input-row">
+                  <el-input v-model="settingsForm.save_dir" placeholder="例如 /srv/classin/videos（Linux 服务器路径）"></el-input>
+                  <el-button @click="openDirectoryPicker('settings')">浏览</el-button>
+                </div>
+                <span class="hint">单课堂下载和未指定目录的任务使用此目录；视频库的旧文件扫描也只扫描此目录。请填写服务器路径，不是你电脑的 D:\ 下载路径。</span>
+              </el-form-item>
+              <el-form-item label="并发线程">
+                <el-input-number v-model="settingsForm.max_workers" :min="1" :max="8"></el-input-number>
+                <span class="hint">单课堂视频并发下载线程数</span>
+              </el-form-item>
+              <el-form-item label="限速 (KB/s)">
+                <el-input-number v-model="settingsForm.speed_limit" :min="0" :step="100"></el-input-number>
+                <span class="hint">0 = 不限速</span>
+              </el-form-item>
+              <el-form-item label="跳过已存在">
+                <el-switch v-model="settingsForm.skip_existing"></el-switch>
+                <span class="hint">重跑时跳过本次任务目标目录中已有文件</span>
+              </el-form-item>
+              <el-form-item label="无头模式">
+                <el-switch v-model="settingsForm.headless"></el-switch>
+                <span class="hint">不显示浏览器窗口（服务器部署建议开启）</span>
+              </el-form-item>
+              <el-form-item label="驱动路径">
+                <el-input v-model="settingsForm.driver_path" placeholder="留空自动检测/下载"></el-input>
+              </el-form-item>
+              <el-form-item>
+                <el-button type="primary" @click="saveSettings">保存配置</el-button>
+                <el-button @click="loadEngine">检测浏览器环境</el-button>
+                <span class="hint" v-if="engineInfo.browser">
+                  浏览器: {{ engineInfo.browser }} {{ engineInfo.driver_ready ? '✅ 驱动就绪' : '⚠️ 未找到驱动' }}
+                </span>
+              </el-form-item>
+            </el-form>
+          </el-card>
+
+          <el-card shadow="never">
+            <template #header><div class="card-head">登录 Cookie</div></template>
+            <el-alert type="warning" :closable="false" show-icon title="Cookie 是登录凭证，泄露等于账号泄露，请勿分享。" class="mb12"></el-alert>
+            <el-input v-model="settingsForm.cookie" type="textarea" :rows="6"
+              placeholder="从浏览器 F12 → Network → 请求头复制 Cookie 粘贴到这里"></el-input>
+            <div class="cookie-state" v-if="settingsSaved.has_cookie">
+              当前已配置：<code>{{ settingsSaved.cookie_masked }}</code>
+            </div>
+            <div class="mt12">
+              <el-button type="primary" @click="saveSettings">保存 Cookie</el-button>
+              <el-button :loading="verifying" @click="verifyCookie">验证有效性</el-button>
+              <span :class="cookieCheckClass" v-if="cookieCheckMsg">{{ cookieCheckMsg }}</span>
+            </div>
+          </el-card>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- ===== 课堂 编辑对话框 ===== -->
+  <el-dialog v-model="lessonDialog.visible" :title="lessonDialog.form.id ? '编辑课堂' : '新增课堂'" width="540px">
+    <el-form label-width="90px">
+      <el-form-item label="课堂ID" required>
+        <el-input v-model="lessonDialog.form.lesson_id" :disabled="!!lessonDialog.form.id" placeholder="平台课堂ID（不可修改）"></el-input>
+      </el-form-item>
+      <el-form-item label="班级ID">
+        <el-input v-model="lessonDialog.form.class_id"></el-input>
+      </el-form-item>
+      <el-form-item label="班级名称">
+        <el-input v-model="lessonDialog.form.class_name"></el-input>
+      </el-form-item>
+      <el-form-item label="课堂名称">
+        <el-input v-model="lessonDialog.form.lesson_name"></el-input>
+      </el-form-item>
+      <el-form-item label="开课时间">
+        <el-input v-model="lessonDialog.form.start_time" placeholder="如 2026/4/5 18:00"></el-input>
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="lessonDialog.visible=false">取消</el-button>
+      <el-button type="primary" @click="saveLesson">保存</el-button>
+    </template>
+  </el-dialog>
+
+  <!-- ===== 导入对话框 ===== -->
+  <el-dialog v-model="importVisible" title="导入课堂列表" width="480px">
+    <el-upload drag :auto-upload="false" :limit="1" accept=".csv,.xlsx,.xlsm" :on-change="onImportFile">
+      <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
+      <div class="el-upload__text">将 CSV/XLSX 文件拖到此处，或<em>点击选择</em></div>
+      <template #tip>
+        <div class="el-upload__tip">支持 ClassIn 导出的课堂统计表（含"课堂ID"列），重复导入自动更新</div>
+      </template>
+    </el-upload>
+    <template #footer>
+      <el-button @click="importVisible=false">取消</el-button>
+      <el-button type="primary" :loading="importing" :disabled="!importFile" @click="doImport">开始导入</el-button>
+    </template>
+  </el-dialog>
+
+  <!-- ===== 新建任务对话框 ===== -->
+  <el-dialog v-model="taskDialog.visible" title="新建下载任务" width="520px">
+    <el-form label-width="90px">
+      <el-form-item label="任务名称" required>
+        <el-input v-model="taskDialog.name" placeholder="如：4月全量下载"></el-input>
+      </el-form-item>
+      <el-form-item label="课堂范围">
+        <el-radio-group v-model="taskDialog.scope">
+          <el-radio value="all">全部课堂（{{ lessonQuery.total }} 条）</el-radio>
+          <el-radio value="selected" :disabled="!selectedLessons.length">已勾选（{{ selectedLessons.length }} 条）</el-radio>
+        </el-radio-group>
+      </el-form-item>
+      <el-form-item label="本任务保存目录">
+        <div class="path-input-row">
+          <el-input v-model="taskDialog.save_dir" placeholder="可选；留空使用默认下载根目录"></el-input>
+          <el-button @click="openDirectoryPicker('task')">浏览</el-button>
+        </div>
+        <span class="hint">仅覆盖本次任务的保存位置；旧文件扫描仍使用系统设置中的默认下载根目录。</span>
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="taskDialog.visible=false">取消</el-button>
+      <el-button type="primary" @click="createTask">创建</el-button>
+    </template>
+  </el-dialog>
+
+  <!-- ===== 服务器目录选择器 ===== -->
+  <el-dialog v-model="dirPicker.visible" title="选择服务器目录" width="620px" v-loading="dirPicker.loading">
+    <div class="dir-picker-path">
+      <el-button :disabled="!dirPicker.parent_path" @click="browseDirectory(dirPicker.parent_path)">上级</el-button>
+      <code>{{ dirPicker.current_path || '选择磁盘' }}</code>
+      <el-button v-if="dirPicker.current_path" @click="browseDirectory('')">根目录</el-button>
+    </div>
+    <div class="dir-picker-list">
+      <el-empty v-if="!dirPicker.directories.length" description="当前目录没有可访问的子目录"></el-empty>
+      <div v-for="item in dirPicker.directories" :key="item.path" class="dir-picker-item" @click="browseDirectory(item.path)">
+        <el-icon><Folder /></el-icon><span>{{ item.name }}</span><el-icon><ArrowRight /></el-icon>
+      </div>
+    </div>
+    <template #footer>
+      <el-button @click="dirPicker.visible=false">取消</el-button>
+      <el-button type="primary" :disabled="!dirPicker.current_path" @click="chooseDirectory">选择当前目录</el-button>
+    </template>
+  </el-dialog>
+
+  <!-- ===== 任务详情抽屉 ===== -->
+  <el-drawer v-model="detail.visible" :title="`任务 #${detail.task.id} ${detail.task.name || ''}`" size="60%">
+    <template v-if="detail.task.id">
+      <div class="detail-head">
+        <el-tag :type="statusTag(detail.task.status)" size="large">{{ statusZh(detail.task.status) }}</el-tag>
+        <el-progress :percentage="detail.task.percent" :status="detail.task.status==='failed'?'exception':null"
+          :stroke-width="14" style="flex:1"></el-progress>
+        <span class="speed" v-if="detail.task.status==='running'">{{ detail.task.speed_mbps.toFixed(2) }} MB/s</span>
+        <el-button v-if="detail.task.status==='running'" type="warning" size="small" @click="taskAction(detail.task,'pause')">暂停</el-button>
+        <el-button v-if="detail.task.status==='paused'" type="success" size="small" @click="taskAction(detail.task,'resume')">继续</el-button>
+        <el-button v-if="detail.task.status==='running'||detail.task.status==='paused'" type="danger" size="small" @click="taskAction(detail.task,'stop')">停止</el-button>
+      </div>
+      <el-alert v-if="detail.task.error" type="error" :title="detail.task.error" :closable="false" class="mb12"></el-alert>
+
+      <el-tabs v-model="detail.tab">
+        <el-tab-pane label="课堂明细" name="items">
+          <el-table :data="detail.task.items" size="small" max-height="320">
+            <el-table-column prop="class_name" label="班级" min-width="140" show-overflow-tooltip></el-table-column>
+            <el-table-column prop="lesson_name" label="课堂" min-width="180" show-overflow-tooltip></el-table-column>
+            <el-table-column label="状态" width="90">
+              <template #default="{row}"><el-tag size="small" :type="lessonStatusTag(row.status)">{{ lessonStatusZh(row.status) }}</el-tag></template>
+            </el-table-column>
+            <el-table-column label="视频" width="90">
+              <template #default="{row}">{{ row.video_done }}/{{ row.video_total || '-' }}</template>
+            </el-table-column>
+            <el-table-column label="进度" min-width="140">
+              <template #default="{row}"><el-progress :percentage="row.percent" :stroke-width="8"></el-progress></template>
+            </el-table-column>
+            <el-table-column prop="message" label="备注" min-width="120" show-overflow-tooltip></el-table-column>
+          </el-table>
+        </el-tab-pane>
+        <el-tab-pane label="运行日志" name="logs">
+          <div class="log-box" ref="logBox">
+            <div v-for="log in detail.logs" :key="log.id" class="log-line" :class="'lv-'+log.level.toLowerCase()">
+              <span class="log-time">{{ fmtTime(log.created_at) }}</span> {{ log.message }}
+            </div>
+            <el-empty v-if="!detail.logs.length" description="暂无日志" :image-size="60"></el-empty>
+          </div>
+        </el-tab-pane>
+      </el-tabs>
+    </template>
+  </el-drawer>
+
+  <el-dialog v-if="videoPlayer" v-model="videoPlayer.visible" :title="videoPlayer.title" width="min(900px, 92vw)" @closed="closeVideoPlayer"><video v-if="videoPlayer.url" class="video-player" :src="videoPlayer.url" controls autoplay playsinline></video></el-dialog>
+
+  <!-- ===== 修改密码 ===== -->
+  <el-dialog v-model="pwdDialog.visible" title="修改密码" width="420px">
+    <el-form label-width="90px">
+      <el-form-item label="原密码"><el-input v-model="pwdDialog.old" type="password" show-password></el-input></el-form-item>
+      <el-form-item label="新密码"><el-input v-model="pwdDialog.new1" type="password" show-password></el-input></el-form-item>
+      <el-form-item label="确认新密码"><el-input v-model="pwdDialog.new2" type="password" show-password></el-input></el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="pwdDialog.visible=false">取消</el-button>
+      <el-button type="primary" @click="changePassword">确定</el-button>
+    </template>
+  </el-dialog>
+</div>
+
+<script src="/static/vendor/vue.global.prod.js"></script>
+<script src="/static/vendor/element-plus.min.js"></script>
+<script src="/static/vendor/element-icons.js"></script>
+<script src="/static/app.js?v=20261009-lesson-download-id-paths"></script>
+</body>
+</html>

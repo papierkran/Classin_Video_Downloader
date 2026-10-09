@@ -1,0 +1,34 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+
+# Runtime data: database, secret key, logs and downloaded videos
+/data/
+*.log
+
+# Downloaded browser drivers and webdriver-manager cache
+/backend/engine/.wdm/
+/backend/engine/msedgedriver
+/backend/engine/msedgedriver.exe
+/backend/engine/chromedriver
+/backend/engine/chromedriver.exe
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.bak

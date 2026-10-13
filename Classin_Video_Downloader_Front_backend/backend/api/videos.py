@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, literal, or_, select
 from sqlalchemy.orm import Session
 
 from ..core.exceptions import AuthError, ConflictError, NotFoundError
@@ -32,18 +32,94 @@ def scan_video_files(_: User = Depends(current_user), db: Session = Depends(db_s
     return {**result, "message": "扫描完成"}
 
 
+@router.get("/classes")
+def list_video_classes(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=200),
+    keyword: str = "",
+    _: User = Depends(current_user),
+    db: Session = Depends(db_session),
+):
+    """视频库一级列表：按班级汇总课堂数、片段数、状态和总大小。"""
+    class_group = case(
+        (Lesson.class_id.is_not(None) & (Lesson.class_id != ""), Lesson.class_id),
+        else_=(literal("name:") + func.coalesce(Lesson.class_name, "未命名班级")),
+    )
+    stmt = select(
+        func.max(Lesson.class_id).label("class_id"),
+        func.max(Lesson.class_name).label("class_name"),
+        func.count(func.distinct(Lesson.id)).label("lesson_count"),
+        func.count(VideoAsset.id).label("video_count"),
+        func.coalesce(func.sum(case((VideoAsset.status.in_(("success", "skipped")), 1), else_=0)), 0).label("ready_count"),
+        func.coalesce(func.sum(case((VideoAsset.status == "failed", 1), else_=0)), 0).label("failed_count"),
+        func.coalesce(func.sum(VideoAsset.size_bytes), 0).label("size_bytes"),
+    ).outerjoin(VideoAsset, VideoAsset.lesson_id == Lesson.lesson_id).group_by(class_group)
+    if keyword.strip():
+        pattern = f"%{keyword.strip()}%"
+        stmt = stmt.where(or_(Lesson.class_name.ilike(pattern), Lesson.class_id.ilike(pattern), Lesson.lesson_name.ilike(pattern), Lesson.lesson_id.ilike(pattern)))
+
+    grouped = stmt.with_only_columns(class_group).group_by(class_group).subquery()
+    total = db.scalar(select(func.count()).select_from(grouped)) or 0
+    rows = db.execute(stmt.order_by(func.max(Lesson.class_name), func.max(Lesson.class_id)).offset((page - 1) * page_size).limit(page_size)).all()
+    items = []
+    for row in rows:
+        class_id, class_name, lesson_count, video_count, ready_count, failed_count, size_bytes = row
+        class_id = class_id or ""
+        class_name = class_name or "未命名班级"
+        items.append({
+            "class_key": class_id or f"name:{class_name}", "class_id": class_id, "class_name": class_name,
+            "lesson_count": int(lesson_count or 0), "video_count": int(video_count or 0),
+            "ready_count": int(ready_count or 0), "failed_count": int(failed_count or 0),
+            "size_bytes": int(size_bytes or 0),
+        })
+    return {"total": total, "page": page, "page_size": page_size, "items": items}
+
+
+@router.get("/classes/{class_key}/lessons")
+def list_class_video_lessons(
+    class_key: str,
+    _: User = Depends(current_user),
+    db: Session = Depends(db_session),
+):
+    """视频库班级展开层：逐课堂汇总已收录的视频片段。"""
+    if class_key.startswith("name:"):
+        class_name = class_key[5:]
+        class_filter = or_(Lesson.class_id.is_(None), Lesson.class_id == "")
+        stmt = select(Lesson, func.count(VideoAsset.id),
+                      func.coalesce(func.sum(case((VideoAsset.status.in_(("success", "skipped")), 1), else_=0)), 0),
+                      func.coalesce(func.sum(case((VideoAsset.status == "failed", 1), else_=0)), 0),
+                      func.coalesce(func.sum(VideoAsset.size_bytes), 0)) \
+            .outerjoin(VideoAsset, VideoAsset.lesson_id == Lesson.lesson_id).where(class_filter, Lesson.class_name == class_name)
+    else:
+        stmt = select(Lesson, func.count(VideoAsset.id),
+                      func.coalesce(func.sum(case((VideoAsset.status.in_(("success", "skipped")), 1), else_=0)), 0),
+                      func.coalesce(func.sum(case((VideoAsset.status == "failed", 1), else_=0)), 0),
+                      func.coalesce(func.sum(VideoAsset.size_bytes), 0)) \
+            .outerjoin(VideoAsset, VideoAsset.lesson_id == Lesson.lesson_id).where(Lesson.class_id == class_key)
+    rows = db.execute(stmt.group_by(Lesson.id).order_by(Lesson.start_time.desc(), Lesson.lesson_name)).all()
+    return [{
+        "id": lesson.id, "lesson_id": lesson.lesson_id, "lesson_name": lesson.lesson_name or "未命名课堂",
+        "start_time": lesson.start_time or "", "video_count": int(video_count or 0),
+        "ready_count": int(ready_count or 0), "failed_count": int(failed_count or 0),
+        "size_bytes": int(size_bytes or 0),
+    } for lesson, video_count, ready_count, failed_count, size_bytes in rows]
+
+
 @router.get("", response_model=PageOut)
 def list_videos(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
     status: str = "",
     keyword: str = "",
+    lesson_id: str = "",
     _: User = Depends(current_user),
     db: Session = Depends(db_session),
 ):
     stmt = select(VideoAsset, Lesson.lesson_name, Lesson.class_name).outerjoin(
         Lesson, Lesson.lesson_id == VideoAsset.lesson_id
     )
+    if lesson_id:
+        stmt = stmt.where(VideoAsset.lesson_id == lesson_id)
     if status:
         stmt = stmt.where(VideoAsset.status == status)
     if keyword:

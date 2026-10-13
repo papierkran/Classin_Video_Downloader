@@ -62,6 +62,23 @@ body { margin: 0; color: var(--ink); font-family: Inter, "Microsoft YaHei", "Pin
 .fail-num { color: #d94b5b; }
 .video-scan-path { margin: -4px 0 12px; color: #647188; font-size: 12px; }
 .video-scan-path code { color: #39465d; overflow-wrap: anywhere; }
+.video-library-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin: 0 2px 16px; }
+.video-library-title { color: var(--ink); font-size: 18px; font-weight: 720; }
+.video-library-caption { margin-top: 5px; color: var(--muted); font-size: 12px; }
+.video-library-total { display: flex; align-items: baseline; gap: 8px; padding: 9px 14px; border: 1px solid #e4e7ff; border-radius: 10px; background: #f3f4ff; color: #727c91; font-size: 12px; white-space: nowrap; }
+.video-library-total strong { color: var(--accent); font-size: 20px; }
+.video-library .el-table { min-width: 930px; }
+.video-library .el-table .cell { line-height: 1.45; }
+.video-class-expand { padding: 14px 16px 14px 38px; background: #f8f9fc; }
+.video-lesson-expand { padding: 12px 14px 12px 34px; border-radius: 8px; background: #fff; }
+.video-class-expand .el-table, .video-lesson-expand .el-table { border-radius: 8px; }
+.video-library .el-table__expanded-cell { padding: 8px 12px !important; background: #f8f9fc; }
+.video-class-name { overflow: hidden; color: #303b51; font-size: 13px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.video-lesson-name { overflow: hidden; margin-top: 4px; color: #8791a3; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.video-title { overflow: hidden; color: #374158; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.video-meta { margin-top: 4px; color: #929bad; font-size: 11px; }
+.video-error { color: #cc4d5b; }
+.video-muted { color: #a3abba; }
 
 /* 设置、目录选择 */
 .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 18px; }
@@ -103,6 +120,8 @@ body { margin: 0; color: var(--ink); font-family: Inter, "Microsoft YaHei", "Pin
   .topbar { height: 60px; padding: 0 16px; }
   .page-title { font-size: 16px; }
   .content { padding: 16px 12px 28px; }
+  .video-library-heading { align-items: flex-start; }
+  .video-library .el-table { min-width: 930px; }
   .stat-row { gap: 10px; }
   .stat-card { padding: 16px; }
   .stat-num { font-size: 25px; }

@@ -525,6 +525,7 @@ def scan_existing_video_files(db: Session, root: str) -> dict[str, int]:
         by_leaf.setdefault(legacy_leaf.casefold(), {})[lesson.id] = lesson
         by_leaf.setdefault(id_leaf.casefold(), {})[lesson.id] = lesson
 
+    lesson_by_id = {safe(lesson.lesson_id).casefold(): lesson for lesson in lessons if lesson.lesson_id}
     indexed = existing = unmatched = 0
     for current, _, files in os.walk(base):
         folder = os.path.basename(current).casefold()
@@ -539,9 +540,19 @@ def scan_existing_video_files(db: Session, root: str) -> dict[str, int]:
                 size = os.path.getsize(full_path)
             except (OSError, ValueError):
                 continue
-            matches_by_id = {}
+            # ID 是目录名末尾的稳定键；优先按课堂 ID + 班级 ID 匹配，
+            # 课堂名称/日期可能被人工修正，不能因此让旧文件变成“无法匹配”。
+            folder_lesson_id = folder.rsplit("_", 1)[-1]
+            folder_class_id = class_folder.rsplit("_", 1)[-1]
+            candidate = lesson_by_id.get(folder_lesson_id)
+            id_matches = [candidate] if (
+                candidate and candidate.class_id
+                and safe(candidate.class_id).casefold() == folder_class_id
+            ) else []
+            matches_by_id = {lesson.id: lesson for lesson in id_matches}
+            # 兼容旧目录和 ID 不可用的记录，才回退到完整目录名匹配。
             for (leaf, suffix), group in expected.items():
-                if leaf == folder and class_folder.endswith(suffix):
+                if not matches_by_id and leaf == folder and class_folder.endswith(suffix):
                     matches_by_id.update(group)
             matches = list(matches_by_id.values())
             if not matches and len(by_leaf.get(folder, {})) == 1:

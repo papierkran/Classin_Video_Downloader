@@ -169,7 +169,13 @@ const app = createApp({
 
     /* ===== 视频库 ===== */
     const videos = ref([]);
+    const videoClasses = ref([]);
+    const classLessons = reactive({});
+    const classLessonLoading = reactive({});
+    const lessonVideos = reactive({});
+    const lessonVideoLoading = reactive({});
     const videoLoading = ref(false);
+    const scanningVideos = ref(false);
     const videoQuery = reactive({ page: 1, page_size: 20, total: 0, keyword: '', status: '' });
     const videoPlayer = reactive({ visible: false, title: '', url: '', id: 0 });
     let playbackTimer = null;
@@ -179,10 +185,42 @@ const app = createApp({
       videoLoading.value = true;
       try {
         const q = new URLSearchParams({ page: videoQuery.page, page_size: videoQuery.page_size, keyword: videoQuery.keyword, status: videoQuery.status });
-        const data = await api('/api/videos?' + q);
-        videos.value = data.items;
+        const data = await api('/api/videos/classes?' + q);
+        videoClasses.value = data.items;
         videoQuery.total = data.total;
       } finally { videoLoading.value = false; }
+    }
+
+    async function onClassExpand(row, expandedRows) {
+      const expanded = expandedRows.some(item => item.class_key === row.class_key);
+      if (!expanded || Object.prototype.hasOwnProperty.call(classLessons, row.class_key)) return;
+      classLessonLoading[row.class_key] = true;
+      try {
+        classLessons[row.class_key] = await api(`/api/videos/classes/${encodeURIComponent(row.class_key)}/lessons`);
+      } finally { classLessonLoading[row.class_key] = false; }
+    }
+
+    async function loadLessonVideos(lessonId) {
+      lessonVideoLoading[lessonId] = true;
+      try {
+        const q = new URLSearchParams({ page: 1, page_size: 200, lesson_id: lessonId, status: videoQuery.status });
+        const data = await api('/api/videos?' + q);
+        lessonVideos[lessonId] = data.items;
+      } finally { lessonVideoLoading[lessonId] = false; }
+    }
+
+    async function onLessonExpand(row, expandedRows) {
+      const expanded = expandedRows.some(item => item.lesson_id === row.lesson_id);
+      if (!expanded || Object.prototype.hasOwnProperty.call(lessonVideos, row.lesson_id)) return;
+      try { await loadLessonVideos(row.lesson_id); }
+      catch (e) { /* api() 已提示错误；再次展开时可重试 */ }
+    }
+
+    function onVideoStatusChange() {
+      const expandedLessonIds = Object.keys(lessonVideos);
+      expandedLessonIds.forEach(key => delete lessonVideos[key]);
+      loadVideos(1);
+      expandedLessonIds.forEach(key => loadLessonVideos(key).catch(() => {}));
     }
 
     async function playVideo(row) {
@@ -204,9 +242,12 @@ const app = createApp({
     }
 
     async function scanVideos() {
-      const result = await api('/api/videos/scan', { method: 'POST' });
-      ElementPlus.ElMessage.success(`扫描完成：新增 ${result.indexed} 个，未匹配 ${result.unmatched} 个`);
-      loadVideos(1);
+      scanningVideos.value = true;
+      try {
+        const result = await api('/api/videos/scan', { method: 'POST' });
+        ElementPlus.ElMessage.success(`扫描完成：新增 ${result.indexed} 个，未匹配 ${result.unmatched} 个`);
+        loadVideos(1);
+      } finally { scanningVideos.value = false; }
     }
 
     async function downloadVideo(row) {
@@ -223,6 +264,7 @@ const app = createApp({
       const task = await api(`/api/videos/${row.id}/retry`, { method: 'POST' });
       ElementPlus.ElMessage.success(`已启动课堂重试任务 #${task.id}`);
       loadVideos(videoQuery.page);
+      loadLessonVideos(row.lesson_id);
       loadTasks(1);
       loadStats();
     }
@@ -437,7 +479,9 @@ const app = createApp({
       openLessonDialog, saveLesson, deleteLesson, batchDeleteLessons, loadLessons,
       tasks, taskLoading, taskQuery, taskDialog, detail, TASK_STATUS,
       loadTasks, openTaskDialog, createTask, taskAction, deleteTask, openTaskDetail,
-      videos, videoLoading, videoQuery, videoPlayer, VIDEO_STATUS, loadVideos, playVideo, closeVideoPlayer, downloadVideo, retryVideo, scanVideos,
+      videos, videoClasses, classLessons, classLessonLoading, lessonVideos, lessonVideoLoading,
+      videoLoading, videoQuery, videoPlayer, VIDEO_STATUS, loadVideos, onClassExpand, onLessonExpand, onVideoStatusChange,
+      playVideo, closeVideoPlayer, downloadVideo, retryVideo, scanVideos, scanningVideos,
       settingsSaved, settingsForm, engineInfo, verifying, cookieCheckMsg, cookieCheckClass,
       loadSettings, saveSettings, verifyCookie, loadEngine,
       dirPicker, openDirectoryPicker, browseDirectory, chooseDirectory,

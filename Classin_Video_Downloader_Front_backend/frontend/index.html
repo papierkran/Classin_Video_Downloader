@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ClassIn 视频下载管理系统</title>
   <link rel="stylesheet" href="/static/vendor/element-plus.css">
-  <link rel="stylesheet" href="/static/styles.css?v=20261009-path-clarity">
+  <link rel="stylesheet" href="/static/styles.css?v=20261014-video-library">
 </head>
 <body>
 <div id="app" v-cloak>
@@ -138,35 +138,85 @@
         </div>
 
         <!-- ===== 视频库 ===== -->
-        <div v-show="view==='videos'">
+        <div v-show="view==='videos'" class="video-library">
+          <div class="video-library-heading">
+            <div>
+              <div class="video-library-title">班级资源</div>
+              <div class="video-library-caption">先按班级查看课堂和视频数量，展开班级后可查看课堂与片段</div>
+            </div>
+            <div class="video-library-total"><strong>{{ videoQuery.total }}</strong><span>个班级</span></div>
+          </div>
           <el-alert class="mb12" type="info" :closable="false" title="视频库会自动收录本系统下载的视频。扫描仅用于补录服务器上已有的旧视频，扫描范围是「系统设置 → 默认下载根目录」；迁移旧视频时请把原目录完整复制到该位置并保留班级/课堂文件夹结构。"></el-alert>
           <div v-if="settingsSaved.save_dir" class="video-scan-path">旧视频扫描目录：<code>{{ settingsSaved.save_dir }}</code></div>
           <el-card shadow="never" class="mb12">
             <div class="toolbar">
-              <el-input v-model="videoQuery.keyword" placeholder="搜索课堂、班级或片段名称" clearable style="width:280px" @keyup.enter="loadVideos(1)" @clear="loadVideos(1)"></el-input>
-              <el-select v-model="videoQuery.status" placeholder="视频状态" clearable style="width:150px" @change="loadVideos(1)">
+              <el-input v-model="videoQuery.keyword" placeholder="搜索班级或课堂名称 / ID" clearable style="width:280px" @keyup.enter="loadVideos(1)" @clear="loadVideos(1)"></el-input>
+              <el-select v-model="videoQuery.status" placeholder="片段状态（展开后筛选）" clearable style="width:190px" @change="onVideoStatusChange">
                 <el-option v-for="(zh,key) in VIDEO_STATUS" :key="key" :label="zh" :value="key"></el-option>
               </el-select>
               <el-button type="primary" @click="loadVideos(1)">查询</el-button>
               <div class="spacer"></div>
-              <el-button type="success" plain @click="scanVideos">扫描默认下载目录</el-button>
+              <el-button type="success" plain :loading="scanningVideos" @click="scanVideos">扫描默认下载目录</el-button>
               <span class="sub-text">下载完成或已跳过的视频可在线播放</span>
             </div>
           </el-card>
           <el-card shadow="never">
-            <el-table :data="videos" v-loading="videoLoading" size="large">
-              <el-table-column prop="class_name" label="班级" min-width="150" show-overflow-tooltip></el-table-column>
-              <el-table-column prop="lesson_name" label="课堂" min-width="180" show-overflow-tooltip></el-table-column>
-              <el-table-column prop="title" label="视频片段" min-width="190" show-overflow-tooltip></el-table-column>
-              <el-table-column prop="record_date" label="录制日期" width="130"></el-table-column>
-              <el-table-column label="状态" width="105">
+            <el-table :data="videoClasses" v-loading="videoLoading" row-key="class_key" size="large" @expand-change="onClassExpand">
+              <el-table-column type="expand" width="48">
+                <template #default="{row:classRow}">
+                  <div class="video-class-expand">
+                    <el-table :data="classLessons[classRow.class_key] || []" v-loading="classLessonLoading[classRow.class_key]" row-key="lesson_id" size="small" @expand-change="onLessonExpand">
+                      <el-table-column type="expand" width="42">
+                        <template #default="{row:lessonRow}">
+                          <div class="video-lesson-expand">
+                            <el-table :data="lessonVideos[lessonRow.lesson_id] || []" v-loading="lessonVideoLoading[lessonRow.lesson_id]" size="small" empty-text="该课堂还没有已收录的视频片段">
+                              <el-table-column label="视频片段" min-width="240">
+                                <template #default="{row}"><div class="video-title">{{ row.title }}</div><div class="video-meta">{{ row.record_date || '日期未知' }}<span v-if="row.record_method"> · {{ row.record_method }}</span></div></template>
+                              </el-table-column>
+                              <el-table-column label="状态" width="100"><template #default="{row}"><el-tag size="small" :type="videoStatusTag(row.status)">{{ VIDEO_STATUS[row.status] || row.status }}</el-tag></template></el-table-column>
+                              <el-table-column label="大小" width="110"><template #default="{row}">{{ formatBytes(row.size_bytes) }}</template></el-table-column>
+                              <el-table-column label="异常信息" min-width="180" show-overflow-tooltip><template #default="{row}"><span v-if="row.error" class="video-error">{{ row.error }}</span><span v-else class="video-muted">—</span></template></el-table-column>
+                              <el-table-column label="操作" width="150" fixed="right">
+                                <template #default="{row}">
+                                  <el-button v-if="row.status==='success'||row.status==='skipped'" link type="primary" @click="playVideo(row)">播放</el-button>
+                                  <el-button v-if="row.status==='success'||row.status==='skipped'" link type="success" @click="downloadVideo(row)">下载</el-button>
+                                  <el-button v-if="row.status==='failed'" link type="warning" @click="retryVideo(row)">重试</el-button>
+                                </template>
+                              </el-table-column>
+                            </el-table>
+                          </div>
+                        </template>
+                      </el-table-column>
+                      <el-table-column prop="lesson_name" label="课堂" min-width="260" show-overflow-tooltip></el-table-column>
+                      <el-table-column prop="start_time" label="开课时间" width="170"></el-table-column>
+                      <el-table-column prop="video_count" label="视频数" width="90"></el-table-column>
+                      <el-table-column label="已完成" width="100"><template #default="{row}">{{ row.ready_count }}/{{ row.video_count }}</template></el-table-column>
+                      <el-table-column label="失败" width="80"><template #default="{row}"><span :class="{'fail-num': row.failed_count}">{{ row.failed_count }}</span></template></el-table-column>
+                      <el-table-column label="总大小" width="110"><template #default="{row}">{{ formatBytes(row.size_bytes) }}</template></el-table-column>
+                    </el-table>
+                    <el-empty v-if="!(classLessons[classRow.class_key] || []).length && !classLessonLoading[classRow.class_key]" description="这个班级还没有课堂记录" :image-size="56"></el-empty>
+                  </div>
+                </template>
+              </el-table-column>
+              <el-table-column label="班级" min-width="280">
+                <template #default="{row}"><div class="video-class-name">{{ row.class_name }}</div><div class="video-lesson-name">班级 ID：{{ row.class_id || '未提供' }}</div></template>
+              </el-table-column>
+              <el-table-column prop="lesson_count" label="课堂数" width="110"></el-table-column>
+              <el-table-column prop="video_count" label="视频数" width="110"></el-table-column>
+              <el-table-column label="已完成" width="120"><template #default="{row}">{{ row.ready_count }}/{{ row.video_count }}</template></el-table-column>
+              <el-table-column label="失败" width="90"><template #default="{row}"><span :class="{'fail-num': row.failed_count}">{{ row.failed_count }}</span></template></el-table-column>
+              <el-table-column label="占用空间" width="130"><template #default="{row}">{{ formatBytes(row.size_bytes) }}</template></el-table-column>
+              <el-table-column label="操作" width="100"><template #default><span class="video-muted">展开查看课堂</span></template></el-table-column>
+              <el-table-column v-if="false" label="状态" width="105">
                 <template #default="{row}"><el-tag :type="videoStatusTag(row.status)">{{ videoStatusZh(row.status) }}</el-tag></template>
               </el-table-column>
-              <el-table-column label="大小" width="100">
+              <el-table-column v-if="false" label="大小" width="100">
                 <template #default="{row}">{{ formatBytes(row.size_bytes) }}</template>
               </el-table-column>
-              <el-table-column prop="error" label="失败原因" min-width="170" show-overflow-tooltip></el-table-column>
-              <el-table-column label="操作" width="155" fixed="right">
+              <el-table-column v-if="false" label="异常信息" min-width="180" show-overflow-tooltip>
+                <template #default="{row}"><span v-if="row.error" class="video-error">{{ row.error }}</span><span v-else class="video-muted">—</span></template>
+              </el-table-column>
+              <el-table-column v-if="false" label="操作" width="155" fixed="right">
                 <template #default="{row}">
                   <el-button v-if="row.status==='success'||row.status==='skipped'" link type="primary" @click="playVideo(row)">播放</el-button>
                   <el-button v-if="row.status==='failed'" link type="warning" @click="retryVideo(row)">重试课堂</el-button>
@@ -440,6 +490,6 @@
 <script src="/static/vendor/vue.global.prod.js"></script>
 <script src="/static/vendor/element-plus.min.js"></script>
 <script src="/static/vendor/element-icons.js"></script>
-<script src="/static/app.js?v=20261009-lesson-download-id-paths"></script>
+<script src="/static/app.js?v=20261014-video-library"></script>
 </body>
 </html>

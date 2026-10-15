@@ -65,6 +65,11 @@ class Lesson(Base):
     class_name: Mapped[str] = mapped_column(String(255), default="", index=True)  # 搜索/分组常用 → 索引
     start_time: Mapped[str] = mapped_column(String(64), default="")  # 原文保存，见模块 docstring
     creation_time: Mapped[str] = mapped_column(String(64), default="")
+    # 课堂同步（sync_service）标记：True=由同步新增且尚未被任何任务纳入。
+    # Why 单独一列而非比对 created_at：同步是幂等 upsert，"新增"只在
+    # 当轮可知；落库标记让自动建任务可以在任意时刻挑出"还没下过的新课"，
+    # 任务创建时统一清标（已纳入 = 不再自动下单），无需回查同步历史。
+    sync_pending: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     # pending/downloading/success/failed —— 与引擎 course_status_callback 对齐
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)  # 仪表盘按状态 GROUP BY → 索引
     message: Mapped[str] = mapped_column(String(255), default="")  # 最近一次结果说明（"完成：4/4"）
@@ -181,4 +186,13 @@ class AppSetting(Base):
     speed_limit: Mapped[int] = mapped_column(Integer, default=0)  # KB/s，0=不限速
     skip_existing: Mapped[bool] = mapped_column(Boolean, default=True)
     headless: Mapped[bool] = mapped_column(Boolean, default=False)
+    # ---- 课堂同步（sync_service，按钮式触发，无调度字段）----
+    # sync_cookie 空时回退到上面的 cookie：同一 SSO 体系下通常一份通用，
+    # 但允许分开配置（同步只读、cookie 用于下载），换下载号时不误伤同步。
+    sync_cookie: Mapped[str] = mapped_column(Text, default="")
+    sync_days: Mapped[int] = mapped_column(Integer, default=7)  # 每次回看的天数窗口（课堂列表 API 的 timeRange）
+    # 同步结果回显（失败也要落库：用户判断"要不要重试"的唯一线索）
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_sync_status: Mapped[str] = mapped_column(String(16), default="")  # ""/success/failed
+    last_sync_message: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

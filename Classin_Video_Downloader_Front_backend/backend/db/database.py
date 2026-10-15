@@ -71,8 +71,41 @@ def init_db() -> None:
     from . import models  # noqa: F401  确保模型注册到 metadata
 
     models.Base.metadata.create_all(bind=engine)
+    _ensure_columns()
     _seed_admin()
     _seed_default_settings()
+
+
+# 增量列迁移表：create_all 只建缺失的表，对已有表新增字段无能为力。
+# Why 不用 Alembic：单机 SQLite、改动仅限于"加列+默认值"，PRAGMA 探测
+# + ALTER 十行代码即可幂等完成；引迁移框架的版本链维护成本远超收益。
+# 注：只加不减——模型删字段后旧库里的历史列保留（SQLite 无 DROP COLUMN
+# 时代遗留，SQLAlchemy 也不会读它们），不需要为此写"删列"迁移。
+_COLUMN_ADDITIONS = {
+    "lessons": [("sync_pending", "INTEGER NOT NULL DEFAULT 0")],
+    "app_settings": [
+        ("sync_cookie", "TEXT NOT NULL DEFAULT ''"),
+        ("sync_days", "INTEGER NOT NULL DEFAULT 7"),
+        ("last_sync_at", "DATETIME"),
+        ("last_sync_status", "VARCHAR(16) NOT NULL DEFAULT ''"),
+        ("last_sync_message", "TEXT NOT NULL DEFAULT ''"),
+    ],
+}
+
+
+def _ensure_columns() -> None:
+    """给旧库补新列（幂等）。Why PRAGMA 探测而非 try/ALTER：
+    SQLite 的 ALTER 重复执行会报 duplicate column，用异常吞掉属
+    "靠报错做流程控制"；先查后改无报错、日志也干净。"""
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        for table, columns in _COLUMN_ADDITIONS.items():
+            existing = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+            for name, ddl in columns:
+                if name not in existing:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+                    logger.info("数据库迁移：%s + %s", table, name)
 
 
 def _seed_admin() -> None:

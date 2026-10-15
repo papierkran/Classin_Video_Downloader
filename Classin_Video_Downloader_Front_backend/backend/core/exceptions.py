@@ -44,11 +44,15 @@ class AuthError(BizError):
 
 
 class ForbiddenError(BizError):
+    """已登录但无权限（当前只有 admin/member 两个角色）。"""
+
     def __init__(self, message: str = "没有权限执行该操作"):
         super().__init__(message, status_code=403, code="FORBIDDEN")
 
 
 class NotFoundError(BizError):
+    """目标资源不存在（查不存在的任务/课堂/视频统一用它）。"""
+
     def __init__(self, message: str = "资源不存在"):
         super().__init__(message, status_code=404, code="NOT_FOUND")
 
@@ -61,6 +65,8 @@ class ConflictError(BizError):
 
 
 class RateLimitedError(BizError):
+    """触发限流（目前仅登录失败次数超限）。"""
+
     def __init__(self, message: str = "操作过于频繁，请稍后再试"):
         super().__init__(message, status_code=429, code="RATE_LIMITED")
 

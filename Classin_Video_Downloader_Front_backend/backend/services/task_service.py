@@ -22,7 +22,7 @@ import threading
 import time
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from ..core.config import settings as app_settings
@@ -134,6 +134,11 @@ class TaskService:
     # ---------- 创建 ----------
 
     def create(self, payload: TaskCreateIn, user_id: int | None = None) -> DownloadTask:
+        """创建任务（不启动）。手动建任务与自动同步共用这一个入口。
+
+        目录回退顺序：调用方指定 → 系统设置默认目录 → 配置默认值。
+        快照式写入 TaskItem：任务执行期间课堂库再变化也不影响已建任务。
+        """
         lessons = self._resolve_lessons(payload.lesson_ids)
         save_dir = (payload.save_dir or "").strip()
         if not save_dir:
@@ -159,6 +164,15 @@ class TaskService:
                     class_name=lesson.class_name,
                     start_time=lesson.start_time,
                 )
+            )
+        # 纳入任务即清"同步新增"标记：自动下载的语义是"只补没下过的新课"，
+        # 不清标记每轮同步都会把同一批课重复下单（手动建任务同样受益——
+        # 用户手动下过的课，同步不必再替它操心）。
+        if lessons:
+            self.db.execute(
+                update(Lesson)
+                .where(Lesson.id.in_([lesson.id for lesson in lessons]), Lesson.sync_pending.is_(True))
+                .values(sync_pending=False)
             )
         self.db.commit()
         logger.info("创建任务 #%d '%s' (%d 个课堂)", task.id, task.name, len(lessons))
@@ -217,7 +231,8 @@ class TaskService:
 
             # 重跑前重置 items（skip_existing 会跳过已有文件，天然支持断点重跑）。
             # Why 重置：上一轮的 failed 状态若残留，_recount 会把旧失败计入
-            # 本轮聚合数，进度与成败统计就失去意义。
+            # 本轮聚合数，进度与成败统计就失去意义。逐字段清零而非重建行：
+            # items.id 是运行时 items_map 的引用目标，换行会让映射失效。
             for item in items:
                 item.status = "pending"
                 item.message = ""
@@ -383,6 +398,8 @@ def _on_log(db: Session, runtime: TaskRuntime, msg: str) -> None:
             db.add(DownloadLog(task_id=runtime.task_id, message=str(msg)[:2000]))
             db.commit()
     except Exception:
+        # rollback 后再吞：日志写失败不影响下载主流程，
+        # 但 session 已脏，不 rollback 会把后续回调一起拖垮
         logger.exception("写任务日志失败")
         db.rollback()
 
@@ -392,9 +409,12 @@ def _on_course_status(db: Session, runtime: TaskRuntime, course: dict, status: s
     try:
         lesson_id = (course or {}).get("lesson_id", "")
         with runtime.lock:
+            # items_done 是总进度的分子：min 封顶防止引擎对同一课重发
+            # 终态事件（重试路径）把进度算超 100%
             if status in ("success", "failed"):
                 runtime.items_done = min(runtime.items_done + 1, runtime.total_items)
                 runtime.speed_mbps = 0.0
+            # 回写课堂表：课堂列表的状态列与仪表盘统计都读这里
             lesson = db.scalars(select(Lesson).where(Lesson.lesson_id == lesson_id)).first()
             if lesson:
                 lesson.status = status
@@ -405,6 +425,8 @@ def _on_course_status(db: Session, runtime: TaskRuntime, course: dict, status: s
                 item.status = status
                 item.message = message[:255]
                 if status in ("success", "failed"):
+                    # 终态行进度定格为 100：失败行的"完成度"由状态列表达，
+                    # 挂着中间百分比反而像还在跑（前端按 status 着色）
                     item.percent = 100
             _recount(db, runtime)
             db.commit()
@@ -425,6 +447,8 @@ def _on_lesson_done(db: Session, runtime: TaskRuntime, info: dict) -> None:
         total = int(info.get("total_videos") or 0)
         downloaded = int(info.get("downloaded") or 0)
         with runtime.lock:
+            # 走 items_map 拿行 id 而不是按 lesson_id 查库：回调高频，
+            # 映射表是启动时建好的内存索引（见 TaskRuntime.items_map）
             item_id = runtime.items_map.get(lesson_id)
             item = db.get(TaskItem, item_id) if item_id else None
             if item:
@@ -441,6 +465,12 @@ def _on_lesson_done(db: Session, runtime: TaskRuntime, info: dict) -> None:
 
 
 def _video_source_key(lesson_id: str, video: dict) -> str:
+    """片段的稳定标识（lesson + 录制日期/方式/标题的哈希）。
+
+    Why 用"业务身份"而不是文件路径：同一片段重试时会换文件名后缀或
+    目录，按路径建键会在台账里长出重复行；哈希后定长，可直接做唯一键。
+    \x1f 是单元分隔符：名称里绝不会出现，拼接不会产生歧义。
+    """
     identity = "\x1f".join(str(video.get(key) or "").strip() for key in ("record_date", "record_method", "segment_title"))
     return hashlib.sha256(f"{lesson_id}\x1f{identity}".encode("utf-8")).hexdigest()
 
@@ -466,6 +496,8 @@ def _on_video_status(db: Session, runtime: TaskRuntime, event: dict) -> None:
             path_asset = db.scalars(select(VideoAsset).where(
                 VideoAsset.lesson_id == lesson_id, VideoAsset.file_path == str(event.get("path") or ""),
             )).first()
+            # 迁移旧文件按路径建过行（source_key=legacy:…），重新下载同一片段
+            # 会命中两条：保留按业务身份建的行，删掉按路径建的那条，防止重复
             if asset is not None and path_asset is not None and asset.id != path_asset.id:
                 db.delete(path_asset)
             elif asset is None:
@@ -475,6 +507,8 @@ def _on_video_status(db: Session, runtime: TaskRuntime, event: dict) -> None:
                 db.add(asset)
             asset.source_key = source_key
             asset.task_id = runtime.task_id
+            # 字段长度都按模型列宽在这里截断：引擎给的标题/错误可能超长，
+            # 让 SQLite 静默截断会与 Pydantic 出参校验打架，显式裁切更可控
             asset.title = str(video.get("segment_title") or "")[:255]
             asset.record_date = str(video.get("record_date") or "")[:64]
             asset.record_method = str(video.get("record_method") or "")[:64]
@@ -493,15 +527,29 @@ def _on_video_status(db: Session, runtime: TaskRuntime, event: dict) -> None:
 
 
 def scan_existing_video_files(db: Session, root: str) -> dict[str, int]:
-    """把服务器已有目录中的视频文件匹配到课堂，供迁移旧下载结果使用。"""
+    """把服务器已有目录中的视频文件匹配到课堂，供迁移旧下载结果使用。
+
+    匹配策略（精确到宽松，宁可漏配不可错配）：
+    1. 目录名末尾的课堂 ID + 一级目录末尾的班级 ID 同时命中（新命名）；
+    2. 完整目录名+班级后缀与"按课堂字段重建的期望目录名"一致（新旧都认）；
+    3. 旧目录名唯一命中唯一课堂时兜底（班级目录未带 ID 的历史结构）。
+    三级都无唯一结果的文件计入 unmatched，由用户人工处理——
+    错配的代价是视频挂到别的课堂下，比漏配难发现得多。
+    """
     base = os.path.realpath(root)
     if not os.path.isdir(base):
         raise ValidationFailure("视频保存目录不存在，请先配置目录并将旧视频复制到服务器")
 
     def safe(value: str) -> str:
+        """文件名清洗（与引擎命名规则同一套非法字符表）。"""
         return re.sub(r'[\\/*?:"<>|]', "_", (value or "").strip()).rstrip(". ") or "_"
 
     def start_folder(value: str) -> str:
+        """把开始时间转为目录名格式：'2026/9/7 21:46' → '2026-09-07_21-46'。
+
+        日期段补零（9→09）是关键：旧版引擎用补零格式建目录，这里不补
+        的话期望目录名和磁盘上的实际目录对不上，整批历史文件失配。
+        """
         text = (value or "").replace("/", "-").replace(" ", "_").replace(":", "-")
         pieces = text.split("_")
         if len(pieces) >= 2:
@@ -512,6 +560,11 @@ def scan_existing_video_files(db: Session, root: str) -> dict[str, int]:
         return safe(value)
 
     lessons = list(db.scalars(select(Lesson)).all())
+    # 两张查找表（值都是 {id: Lesson} 而非单个 Lesson：同名/同目录的
+    # 候选有多个时，宁可判为"歧义不匹配"也不能任选其一——这就是用
+    # 字典收多重候选而不是直接覆盖的原因）：
+    # - expected：(目录名, 班级后缀) → 候选课堂（策略 1/2 精确匹配用）
+    # - by_leaf：目录名 → 候选课堂（策略 3 宽松兜底用）
     expected: dict[tuple[str, str], dict[int, Lesson]] = {}
     by_leaf: dict[str, dict[int, Lesson]] = {}
     for lesson in lessons:
@@ -535,11 +588,13 @@ def scan_existing_video_files(db: Session, root: str) -> dict[str, int]:
                 continue
             full_path = os.path.realpath(os.path.join(current, filename))
             try:
+                # commonpath 防目录穿越：目录里可能有指向外部位置的软链，
+                # 只有解析后仍位于扫描根内的文件才录入台账
                 if os.path.normcase(os.path.commonpath([base, full_path])) != os.path.normcase(base):
                     continue
                 size = os.path.getsize(full_path)
             except (OSError, ValueError):
-                continue
+                continue  # 文件在遍历间隙被删/无权限：跳过，扫描整体不失败
             # ID 是目录名末尾的稳定键；优先按课堂 ID + 班级 ID 匹配，
             # 课堂名称/日期可能被人工修正，不能因此让旧文件变成“无法匹配”。
             folder_lesson_id = folder.rsplit("_", 1)[-1]
@@ -672,6 +727,9 @@ def _finalize(db: Session, runtime: TaskRuntime, error_msg: str) -> None:
             task.finished_at = datetime.utcnow()
             task.speed_mbps = 0.0
             task.current_lesson = ""
+            # 收尾时把所有还挂在 downloading 的视频台账判失败：
+            # 引擎退出后 callback 不会再来了，不在这里清，"下载中"状态
+            # 会永远留在视频库里（用户刷新页面看到永不动的进度条）
             incomplete = list(db.scalars(select(VideoAsset).where(
                 VideoAsset.task_id == runtime.task_id, VideoAsset.status == "downloading",
             )).all())
@@ -682,8 +740,12 @@ def _finalize(db: Session, runtime: TaskRuntime, error_msg: str) -> None:
                     asset.size_bytes = os.path.getsize(asset.file_path) if asset.file_path and os.path.isfile(asset.file_path) else 0
                 except OSError:
                     asset.size_bytes = 0
+            # 只有成功才置满：失败/取消保留实际进度供排查（进度条停在
+            # 中断点比"满格但失败"更能提示用户是中途出的事）
             if status == "success":
-                task.percent = 100  # 只有成功才置满：失败/取消保留实际进度供排查
+                task.percent = 100
+            # 终态日志与终态字段同一事务提交：日志时间线里"任务结束"
+            # 永远出现在状态翻转的同一刻，排查时不会出现顺序错乱
             db.add(
                 DownloadLog(
                     task_id=runtime.task_id,
@@ -718,6 +780,8 @@ def recover_stale_tasks() -> None:
     with SessionLocal() as db:
         stale = list(db.scalars(select(DownloadTask).where(DownloadTask.status.in_(ACTIVE))).all())
         for task in stale:
+            # 逐任务清零 + 单次统一 commit：数量少（最多 1 个活跃任务），
+            # 简单直白比事务优化更重要
             task.status = "failed"
             task.error = "服务重启导致任务中断，请重新启动"
             task.finished_at = datetime.utcnow()

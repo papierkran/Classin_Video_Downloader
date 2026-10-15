@@ -1,6 +1,6 @@
 # ClassIn 视频下载管理系统
 
-前后端一体的 ClassIn 回放视频批量下载管理后台：导入课堂 → 创建任务 → 后台下载 → 实时进度/日志。
+前后端一体的 ClassIn 回放视频批量下载管理后台：导入/同步课堂 → 创建任务 → 后台下载 → 实时进度/日志。
 
 - **后端**：Python 3.12 + FastAPI + SQLAlchemy + SQLite（WAL）
 - **前端**：Vue 3 + Element Plus（本地 vendor，无 CDN、无构建）
@@ -28,6 +28,7 @@ python run.py
 | 课堂管理 | 手工新增、CSV/XLSX 批量导入（upsert 幂等）、状态过滤、关键词搜索、批量删除 |
 | 下载任务 | 选课堂（或全部）建任务；启动/暂停/恢复/停止/重跑/删除；三级进度（任务→课堂→视频）；实时日志（增量游标） |
 | 视频库 | 按课堂/班级/状态搜索视频片段；逐段显示下载中、成功、失败、已存在；支持在线播放、下载、失败课堂重试和扫描服务器旧文件 |
+| 同步管理 | 按钮式同步：配置控制台 Cookie（可回退下载 Cookie）与回看天数；"立即同步"拉取最新课堂入库；"待下载新课"表勾选后一键建任务下载；显示上次同步结果与 Cookie 来源，支持在线验证 Cookie |
 | 系统设置 | Cookie（脱敏显示+在线验证）、保存目录、并发数、限速、跳过已下载、无头模式、改密码 |
 
 ## 核心逻辑拆解
@@ -53,7 +54,10 @@ python run.py
 启动时 `recover_stale_tasks()` 把残留 running/paused/stopping 统一置 failed——进程重启后状态永远可信。
 
 **6. 安全**
-PBKDF2(240k) 口令哈希、JWT 7 天、登录限速（`用户名@IP`）、Cookie 明文只存库且 API 永远脱敏、500 只回 `request_id` 不回堆栈、HOST 默认只绑 127.0.0.1。
+PBKDF2(240k) 口令哈希、JWT 7 天、登录限速（`用户名@IP`）、Cookie 明文只存库且 API 永远脱敏、500 只回 `request_id` 不回堆栈、HOST 默认只绑 127.0.0.1。视频播放走 15 分钟单视频 HttpOnly 票据 + HTTP Range，直链不含令牌、不可跨视频复用。
+
+**7. 课堂同步（按钮式）**
+"立即同步" → `SyncService.run`（`_sync_lock` 非阻塞，重复点击直接 409）→ 直连控制台纯 JSON 接口拉取时间窗内课堂（不驱动浏览器，与下载互不争抢）→ 按 `lesson_id` 幂等 upsert（空值不覆盖，仅新增打 `sync_pending`）→ 前端"待下载新课"表（`GET /api/sync/pending`）勾选已开课课堂 → "下载所选"复用 `TaskService.create+start`（快照/闸门/清标与手动建任务同一套规则），创建任务即清 `sync_pending`。失败也刷新 `last_sync_at` 并落 `last_sync_status/message`（同步卡回显）。
 
 ## Linux / 公网部署（2-3 人）
 
@@ -87,6 +91,8 @@ Front_backend/
 
 ```powershell
 python -m pyflakes backend run.py        # 静态检查（engine 目录为外部代码，除外）
-# 功能验证：启动后 API 路由经 OpenAPI 核验；状态机 E2E 覆盖
+# 功能验证：启动后 API 路由经 OpenAPI 核验（33 路径 / 39 操作）；状态机 E2E 覆盖
 # start→pause→双pause(409)→resume→stop→cancelled 全链路
+# 课堂同步 E2E：GET /api/sync/pending（3 条）→ POST /api/sync/run（真实拉取 3，
+# 复跑 created=updated=0 幂等）→ 按 pending 建任务后列表自动减 1 → POST /api/sync/verify-cookie
 ```

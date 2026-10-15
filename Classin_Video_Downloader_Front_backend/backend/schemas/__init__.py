@@ -232,6 +232,9 @@ class TaskLogsPageOut(BaseModel):
 
 
 class VideoOut(BaseModel):
+    """视频片段出参（视频库表格行）。lesson/class 名称来自 JOIN 而非
+    视频表本身：视频行只存 lesson_id，名称空串表示课堂已删（前端显示占位）。"""
+
     id: int
     lesson_id: str
     lesson_name: str = ""
@@ -247,6 +250,9 @@ class VideoOut(BaseModel):
 
 
 class MediaTicketOut(BaseModel):
+    """播放票据出参。url 是不含令牌的媒体地址（令牌在 HttpOnly Cookie 里），
+    expires_in 让前端能提示"链接有效期"，谁都能看但看不了多久的语义。"""
+
     url: str
     expires_in: int
 
@@ -304,6 +310,65 @@ class CookieVerifyOut(BaseModel):
     message 展示原文（引擎返回的"Cookie已过期"等具体原因）。"""
     valid: bool
     message: str
+
+
+# ---------- 课堂同步 ----------
+
+
+class SyncLessonOut(BaseModel):
+    """待下载新课列表行（同步新增、未纳入过任何任务的课堂）。
+
+    id 是 lessons 表主键，前端勾选后直接作为建任务的 lesson_ids；
+    started 由后端判定开课时间——未开课暂无回放，前端默认不勾选
+    并打"未开课"标签，是否下载仍由用户决定。
+    """
+
+    id: int
+    lesson_id: str
+    lesson_name: str = ""
+    class_name: str = ""
+    start_time: str = ""
+    started: bool = True
+
+
+class SyncConfigOut(BaseModel):
+    """同步配置出参（按钮式同步：只有凭据与回看天数两项）。
+    cookie 只回脱敏值；using_download_cookie 告诉用户"同步实际在用哪份
+    凭据"，避免"明明没配同步 Cookie 却能同步"的疑惑。"""
+
+    cookie_masked: str = ""
+    has_cookie: bool = False
+    using_download_cookie: bool = False
+    days: int = 7
+
+
+class SyncConfigUpdateIn(BaseModel):
+    """同步配置部分更新。cookie 传空串=不修改（与系统设置页同一约定：
+    表单回车带上的空值不能误清凭据）。
+    days ≤365 防误填把时间窗推到几年（拉回一堆历史课）。"""
+
+    cookie: str | None = Field(default=None, max_length=8192)
+    days: int | None = Field(default=None, ge=1, le=365)
+
+
+class SyncRunOut(BaseModel):
+    """单次同步的结果回执（按钮触发）。同步本身不建任务：
+    随后由用户在"待下载新课"列表勾选，走常规任务流程。"""
+
+    fetched: int = 0
+    created: int = 0
+    updated: int = 0
+    message: str = ""
+
+
+class SyncStatusOut(BaseModel):
+    """同步状态卡数据：凭据来源 + 上次结果 + 待处理新课数（无调度概念）。"""
+
+    cookie_source: Literal["sync", "download", "none"] = "none"
+    last_sync_at: datetime | None = None
+    last_sync_status: str = ""
+    last_sync_message: str = ""
+    pending_count: int = 0
 
 
 # ---------- 仪表盘/引擎 ----------

@@ -41,7 +41,7 @@ async def lifespan(_: FastAPI):
     recover_stale_tasks()
     logger.info("服务就绪 http://%s:%d", settings.host, settings.port)
     yield
-    # 无 shutdown 钩子：下载线程是 daemon——进程退出时浏览器可能残留，
+    # 无更多 shutdown 钩子：下载线程是 daemon——进程退出时浏览器可能残留，
     # 但下次启动 recover_stale_tasks 会把状态清干净（优雅停机复杂度
     # 换不来单机场景的实际收益）
 

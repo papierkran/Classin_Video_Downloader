@@ -23,7 +23,12 @@ router = APIRouter(prefix="/api/settings", tags=["设置"])
 
 @router.get("/directories")
 def list_directories(path: str | None = Query(default=None, max_length=4096), _: User = Depends(require_admin)):
-    """返回服务器目录树的一层，仅管理员可用；不返回文件列表。"""
+    """返回服务器目录树的一层，仅管理员可用；不返回文件列表。
+
+    浏览粒度是"一次一层"：目录树可能巨大（一个盘几万个目录），
+    递归返回会让首包等十几秒；前端展开哪层再请求哪层。
+    Windows 空路径特判为"列出所有盘符"（没有统一的根目录可浏览）。
+    """
     if os.name == "nt":
         if not path:
             drives = [f"{chr(letter)}:\\" for letter in range(ord("A"), ord("Z") + 1)
@@ -42,12 +47,14 @@ def list_directories(path: str | None = Query(default=None, max_length=4096), _:
         with os.scandir(current) as entries:
             for entry in entries:
                 try:
+                    # follow_symlinks=False：符号链接指向的目录是"逃出可浏览
+                    # 范围"的通道，只浏览用户物理可见的目录结构
                     if entry.is_dir(follow_symlinks=False):
                         directories.append({"name": entry.name, "path": os.path.abspath(entry.path)})
                 except OSError:
-                    continue
+                    continue  # 单个坏目录项（权限/断链）跳过，不让整页报错
     except PermissionError:
-        directories = []
+        directories = []  # 无权限的目录返回空列表：前端表现为"空目录"而非崩溃
     directories.sort(key=lambda item: item["name"].casefold())
     parent = str(current.parent) if current.parent != current else None
     return {"current_path": str(current), "parent_path": parent, "directories": directories}

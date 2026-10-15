@@ -36,6 +36,7 @@
         <div class="side-item" :class="{on: view==='lessons'}" @click="switchLessons">📚 课堂管理</div>
         <div class="side-item" :class="{on: view==='tasks'}" @click="switchTasks">🎬 下载任务</div>
         <div class="side-item" :class="{on: view==='videos'}" @click="switchVideos">▶️ 视频库</div>
+        <div class="side-item" :class="{on: view==='sync'}" @click="switchSync">🔄 同步管理</div>
         <div class="side-item" :class="{on: view==='settings'}" @click="view='settings'">⚙️ 系统设置</div>
       </div>
       <div class="side-foot">v1.0 前后端一体版</div>
@@ -283,6 +284,83 @@
           </el-card>
         </div>
 
+        <!-- ===== 同步管理（按钮式：同步一次 → 勾选新课 → 建任务下载） ===== -->
+        <div v-show="view==='sync'" class="settings-grid">
+          <el-card shadow="never">
+            <template #header><div class="card-head">同步配置</div></template>
+            <el-form label-width="140px" size="large">
+              <el-form-item label="控制台 Cookie">
+                <el-input v-model="syncForm.cookie" type="textarea" :rows="5"
+                  placeholder="粘贴 ClassIn 控制台（console.eeo.cn）的 Cookie；留空则使用【系统设置】中的下载 Cookie"></el-input>
+                <div class="cookie-state" v-if="syncSaved.has_cookie">
+                  当前同步 Cookie：<code>{{ syncSaved.cookie_masked }}</code>
+                </div>
+                <div class="cookie-state" v-else-if="syncSaved.using_download_cookie">
+                  未配置同步专用 Cookie，自动回退使用【系统设置】里的下载 Cookie
+                </div>
+                <div class="cookie-state" v-else>
+                  尚未配置任何可用的 Cookie，同步无法运行
+                </div>
+                <span class="hint">与下载 Cookie 同属 .eeo.cn 登录态，通常一份即可；换机构账号时可分开填</span>
+              </el-form-item>
+              <el-form-item label="回看天数">
+                <el-input-number v-model="syncForm.days" :min="1" :max="365"></el-input-number>
+                <span class="hint">每次同步拉取"最近 N 天内开课"的课堂</span>
+              </el-form-item>
+              <el-form-item>
+                <el-button type="primary" @click="saveSyncConfig">保存配置</el-button>
+                <el-button :loading="syncVerifying" @click="verifySyncCookie">验证 Cookie</el-button>
+                <span :class="syncCheckClass" v-if="syncCheckMsg">{{ syncCheckMsg }}</span>
+              </el-form-item>
+            </el-form>
+          </el-card>
+
+          <el-card shadow="never">
+            <template #header><div class="card-head">同步操作</div></template>
+            <el-descriptions :column="1" border size="large">
+              <el-descriptions-item label="Cookie 来源">
+                {{ {sync:'同步专用 Cookie', download:'回退使用下载 Cookie', none:'未配置'}[syncStatus.cookie_source] }}
+              </el-descriptions-item>
+              <el-descriptions-item label="上次同步">{{ fmtTime(syncStatus.last_sync_at) || '从未同步' }}</el-descriptions-item>
+              <el-descriptions-item label="上次结果">
+                <el-tag v-if="syncStatus.last_sync_status==='success'" type="success" size="small">成功</el-tag>
+                <el-tag v-else-if="syncStatus.last_sync_status==='failed'" type="danger" size="small">失败</el-tag>
+                <el-tag v-else type="info" size="small">尚未同步</el-tag>
+                <span style="margin-left:8px">{{ syncStatus.last_sync_message || '—' }}</span>
+              </el-descriptions-item>
+            </el-descriptions>
+            <div class="mt12">
+              <el-button type="primary" :loading="syncing" @click="runSyncNow">立即同步</el-button>
+              <span class="hint">从控制台拉取最新课堂列表并入库；不会自动下载——在下方勾选后手动建任务</span>
+            </div>
+          </el-card>
+        </div>
+
+        <!-- 待下载新课：同步新增且未纳入过任务的课堂，勾选后建常规下载任务 -->
+        <div v-show="view==='sync'" class="mt12">
+          <el-card shadow="never">
+            <template #header><div class="card-head">待下载新课（{{ syncPending.length }}）</div></template>
+            <el-table :data="syncPending" ref="syncPendingTable" border @selection-change="onSyncPendingSelect" empty-text="暂无待下载新课：点击上方「立即同步」拉取最新课堂">
+              <el-table-column type="selection" width="46"></el-table-column>
+              <el-table-column prop="class_name" label="班级" min-width="180" show-overflow-tooltip></el-table-column>
+              <el-table-column prop="lesson_name" label="课堂" min-width="220" show-overflow-tooltip></el-table-column>
+              <el-table-column prop="lesson_id" label="课堂ID" width="130"></el-table-column>
+              <el-table-column prop="start_time" label="开课时间" width="150"></el-table-column>
+              <el-table-column label="状态" width="96">
+                <template #default="{ row }">
+                  <el-tag :type="row.started ? 'success' : 'info'" size="small">{{ row.started ? '已开课' : '未开课' }}</el-tag>
+                </template>
+              </el-table-column>
+            </el-table>
+            <div class="mt12">
+              <el-button type="primary" :disabled="!syncSelected.length" :loading="syncDownloading" @click="downloadSelectedLessons">
+                下载所选（{{ syncSelected.length }}）
+              </el-button>
+              <span class="hint">选择课堂即下载该课堂下的全部视频片段；建任务后可在下载任务页查看实时进度与任务日志，已开课课堂默认勾选</span>
+            </div>
+          </el-card>
+        </div>
+
         <!-- ===== 系统设置 ===== -->
         <div v-show="view==='settings'" class="settings-grid">
           <el-card shadow="never">
@@ -490,6 +568,6 @@
 <script src="/static/vendor/vue.global.prod.js"></script>
 <script src="/static/vendor/element-plus.min.js"></script>
 <script src="/static/vendor/element-icons.js"></script>
-<script src="/static/app.js?v=20261014-video-library"></script>
+<script src="/static/app.js?v=20261015-sync2"></script>
 </body>
 </html>

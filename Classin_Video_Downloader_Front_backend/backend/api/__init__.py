@@ -5,7 +5,7 @@ Why 单聚合点：新增模块只需在此 include 一行，main.py 保持稳�
 """
 from fastapi import APIRouter
 
-from . import auth, dashboard, lessons, settings, tasks, videos
+from . import auth, dashboard, lessons, settings, sync, tasks, videos
 
 api_router = APIRouter()
 api_router.include_router(auth.router)
@@ -13,6 +13,7 @@ api_router.include_router(dashboard.router)
 api_router.include_router(lessons.router)
 api_router.include_router(tasks.router)
 api_router.include_router(settings.router)
+api_router.include_router(sync.router)
 api_router.include_router(videos.router)
 
 __all__ = ["api_router"]

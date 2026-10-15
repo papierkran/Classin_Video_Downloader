@@ -42,6 +42,8 @@ class LessonRepo(BaseRepository[Lesson]):
         return list(self.db.scalars(select(Lesson).where(Lesson.id.in_(ids))).all())
 
     def list_all(self) -> list[Lesson]:
+        """全量列表（lesson_ids 未指定时创建"全部课堂"任务用）。
+        课堂量级上限数千，一次性装载可接受；真正的瓶颈始终在下载本身。"""
         return list(self.db.scalars(select(Lesson).order_by(Lesson.start_time.desc())).all())
 
 
@@ -49,6 +51,8 @@ class TaskRepo(BaseRepository[DownloadTask]):
     model = DownloadTask
 
     def filtered(self, status: str = ""):
+        """任务列表条件（状态精确筛选）。id 倒序=最新在前，
+        与用户打开页面的默认预期一致（按创建时间看最新任务）。"""
         stmt = select(DownloadTask)
         if status:
             stmt = stmt.where(DownloadTask.status == status)

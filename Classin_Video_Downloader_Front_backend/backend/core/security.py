@@ -76,12 +76,23 @@ def decode_token(token: str) -> dict:
 
 
 def create_media_token(video_id: int) -> str:
-    """签发短时、仅限单个视频的播放凭证，供原生 video 标签携带。"""
+    """签发短时、仅限单个视频的播放凭证，供原生 video 标签携带。
+
+    与登录 token 同一签名密钥但用 purpose 声明隔离：登录 token 拿来当
+    播放凭证会被 decode_media_token 拒绝（反之亦然），一组密钥两套用途
+    而不互相提权。15 分钟足够看完短视频片段/拖动进度，又限制分享传播。
+    """
     now = int(time.time())
     return jwt.encode({"purpose": "video", "video_id": video_id, "iat": now, "exp": now + 900}, settings.secret_key, algorithm=_ALGO)
 
 
 def decode_media_token(token: str, video_id: int) -> dict:
+    """校验媒体凭证：必须 purpose=video 且 video_id 与请求路径一致。
+
+    Why 查 video_id 绑定：否则拿到任意一个视频的票据就能换 video_id
+    访问全库视频（越权）。过期与无效分文案：过期提示"重新打开"，
+    无效（伪造/串用）只说"无效"，不给出可利用的信息。
+    """
     try:
         payload = jwt.decode(token, settings.secret_key, algorithms=[_ALGO])
         if payload.get("purpose") != "video" or payload.get("video_id") != video_id:
@@ -107,18 +118,23 @@ class LoginRateLimiter:
         self._lock = threading.Lock()
 
     def check(self, key: str) -> None:
+        """登录前置检查：窗口内失败次数达上限即 429（文案含剩余等待时间）。"""
         now = time.time()
         with self._lock:
+            # 顺手淘汰过期记录：不淘汰的话失败次数永远累积，
+            # 用户等够窗口也登不进来（假性永久锁定）
             hits = [t for t in self._failures.get(key, []) if now - t < self._window]
             if len(hits) >= self._max:
                 raise RateLimitedError(f"登录失败次数过多，请 {self._window // 60} 分钟后再试")
             self._failures[key] = hits
 
     def record_failure(self, key: str) -> None:
+        """登录失败后记账（key=用户名或 IP，由调用方决定粒度）。"""
         with self._lock:
             self._failures.setdefault(key, []).append(time.time())
 
     def reset(self, key: str) -> None:
+        """登录成功后清账：成功即证明是合法用户，历史失败不应继续累计。"""
         with self._lock:
             self._failures.pop(key, None)
 

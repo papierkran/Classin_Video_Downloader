@@ -48,7 +48,7 @@ const app = createApp({
     const loginLoading = ref(false);
     const view = ref('dashboard');
 
-    const viewTitle = computed(() => ({ dashboard: '仪表盘', lessons: '课堂管理', tasks: '下载任务', videos: '视频库', settings: '系统设置' }[view.value]));
+    const viewTitle = computed(() => ({ dashboard: '仪表盘', lessons: '课堂管理', tasks: '下载任务', videos: '视频库', sync: '同步管理', settings: '系统设置' }[view.value]));
 
     async function doLogin() {
       if (!loginForm.username || !loginForm.password) return ElementPlus.ElMessage.warning('请输入账号密码');
@@ -431,6 +431,98 @@ const app = createApp({
       try { Object.assign(engineInfo, await api('/api/settings/engine')); } catch (e) { /* 已提示 */ }
     }
 
+    /* ===== 同步管理（按钮式：同步一次 → 勾选待下载新课 → 建常规下载任务） ===== */
+    // syncSaved=服务端已存配置（含脱敏 cookie），syncForm=可编辑表单。
+    // 分开的理由与设置页一致：cookie 明文不回显，表单里为空不代表"没配"。
+    const syncSaved = reactive({ cookie_masked: '', has_cookie: false, using_download_cookie: false, days: 7 });
+    const syncForm = reactive({ cookie: '', days: 7 });
+    const syncStatus = reactive({ cookie_source: 'none', last_sync_at: null, last_sync_status: '', last_sync_message: '', pending_count: 0 });
+    const syncPending = ref([]);       // 待下载新课（勾选源）
+    const syncSelected = ref([]);      // 表格当前勾选行
+    const syncPendingTable = ref(null); // el-table 实例（程序化预选已开课行）
+    const syncing = ref(false);
+    const syncVerifying = ref(false);
+    const syncDownloading = ref(false);
+    const syncCheckMsg = ref('');
+    const syncCheckClass = ref('hint');
+
+    async function loadSync() {
+      try {
+        const [cfg, st, pending] = await Promise.all([
+          api('/api/sync/config'), api('/api/sync/status'), api('/api/sync/pending'),
+        ]);
+        Object.assign(syncSaved, cfg);
+        Object.assign(syncStatus, st);
+        Object.assign(syncForm, { cookie: '', days: cfg.days });
+        syncPending.value = pending;
+        // 默认勾选已开课的课堂（多数场景就是"把新录的课都下了"）；
+        // 未开课的无回放不预选——避免一键下载出一批必然失败的任务
+        nextTick(() => {
+          syncPending.value.forEach(row => { if (row.started) syncPendingTable.value?.toggleRowSelection(row, true); });
+        });
+      } catch (e) { /* 403 非管理员 */ }
+    }
+
+    function onSyncPendingSelect(rows) { syncSelected.value = rows; }
+
+    async function saveSyncConfig() {
+      const body = { days: syncForm.days };
+      if (syncForm.cookie.trim()) body.cookie = syncForm.cookie.trim(); // 填了才覆盖，空串=不修改
+      const cfg = await api('/api/sync/config', { method: 'PUT', body: JSON.stringify(body) });
+      Object.assign(syncSaved, cfg);
+      syncForm.cookie = '';
+      ElementPlus.ElMessage.success('同步配置已保存');
+      loadSync();
+    }
+
+    async function verifySyncCookie() {
+      syncVerifying.value = true;
+      syncCheckMsg.value = '';
+      try {
+        // 验证顺序由后端决定：草稿 → 同步专用 → 下载回退（不填即验当前生效的）
+        const r = await api('/api/sync/verify-cookie', { method: 'POST', body: JSON.stringify({ cookie: syncForm.cookie.trim() || null }) });
+        syncCheckMsg.value = (r.valid ? '✅ ' : '❌ ') + r.message;
+        syncCheckClass.value = r.valid ? 'hint ok' : 'hint bad';
+      } finally { syncVerifying.value = false; }
+    }
+
+    async function runSyncNow() {
+      syncing.value = true;
+      try {
+        const r = await api('/api/sync/run', { method: 'POST' });
+        ElementPlus.ElMessage.success(r.message || '同步完成');
+        loadSync();      // 刷新状态卡 + 待下载列表（新拉到的课出现在下方勾选表）
+        loadLessons(1);  // 课堂库有新增
+        loadStats();
+      } catch (e) { /* api() 已提示（如"同步正在进行中"、Cookie 过期） */ }
+      finally { syncing.value = false; }
+    }
+
+    async function downloadSelectedLessons() {
+      if (!syncSelected.value.length) return;
+      syncDownloading.value = true;
+      try {
+        const now = new Date();
+        const stamp = `${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+        // 与任务页"新建任务"同一接口：同步页只是选课入口，任务创建/启动/
+        // 日志全部复用既有状态机；创建即清 sync_pending，列表自动收缩
+        const task = await api('/api/tasks', { method: 'POST', body: JSON.stringify({ name: `同步下载 ${stamp}`, lesson_ids: syncSelected.value.map(row => row.id) }) });
+        try {
+          await api(`/api/tasks/${task.id}/start`, { method: 'POST' });
+          ElementPlus.ElMessage.success(`已创建任务 #${task.id} 并启动`);
+        } catch (e) {
+          // 任务已建但启动失败（如 Cookie 过期）：任务保留可手动启动，
+          // 不能删掉重来——否则用户看不到失败现场，且每次重试都会新建任务
+          ElementPlus.ElMessage.warning(`任务 #${task.id} 已创建，但启动失败，可在下载任务页手动启动`);
+        }
+        loadSync();
+        view.value = 'tasks'; // 跳到任务页：用户可直接看实时进度与任务日志
+        await loadTasks(1);
+        await openTaskDetail({ id: task.id });
+      } catch (e) { /* api() 已提示 */ }
+      finally { syncDownloading.value = false; }
+    }
+
     /* ===== 用户 ===== */
     const pwdDialog = reactive({ visible: false, old: '', new1: '', new2: '' });
     async function changePassword() {
@@ -450,6 +542,7 @@ const app = createApp({
     function switchLessons() { view.value = 'lessons'; loadLessons(1); }
     function switchTasks() { view.value = 'tasks'; loadTasks(1); }
     function switchVideos() { view.value = 'videos'; loadVideos(1); }
+    function switchSync() { view.value = 'sync'; loadSync(); }
 
     function statusZh(s) { return TASK_STATUS[s] || s; }
     function statusTag(s) { return { created: 'info', running: '', paused: 'warning', stopping: 'warning', success: 'success', failed: 'danger', cancelled: 'info' }[s] || 'info'; }
@@ -465,7 +558,7 @@ const app = createApp({
       loadStats();
       loadLessons(1);
       loadTasks(1);
-      if (user.role === 'admin') loadSettings();
+      if (user.role === 'admin') { loadSettings(); loadSync(); }
     }
 
     onMounted(() => { if (authed.value) bootstrap(); });
@@ -484,9 +577,11 @@ const app = createApp({
       playVideo, closeVideoPlayer, downloadVideo, retryVideo, scanVideos, scanningVideos,
       settingsSaved, settingsForm, engineInfo, verifying, cookieCheckMsg, cookieCheckClass,
       loadSettings, saveSettings, verifyCookie, loadEngine,
+      syncSaved, syncForm, syncStatus, syncPending, syncSelected, syncPendingTable, syncing, syncVerifying, syncDownloading, syncCheckMsg, syncCheckClass,
+      loadSync, saveSyncConfig, verifySyncCookie, runSyncNow, onSyncPendingSelect, downloadSelectedLessons,
       dirPicker, openDirectoryPicker, browseDirectory, chooseDirectory,
       pwdDialog, changePassword, onUserCmd,
-      switchLessons, switchTasks, switchVideos, createTaskFromSelection: openTaskDialog,
+      switchLessons, switchTasks, switchVideos, switchSync, createTaskFromSelection: openTaskDialog,
       statusZh, statusTag, lessonStatusZh, lessonStatusTag, videoStatusZh, videoStatusTag, formatBytes, fmtTime,
     };
   },

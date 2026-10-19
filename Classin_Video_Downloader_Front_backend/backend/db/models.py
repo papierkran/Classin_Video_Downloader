@@ -64,6 +64,11 @@ class Lesson(Base):
     lesson_name: Mapped[str] = mapped_column(String(255), default="")
     class_name: Mapped[str] = mapped_column(String(255), default="", index=True)  # 搜索/分组常用 → 索引
     start_time: Mapped[str] = mapped_column(String(64), default="")  # 原文保存，见模块 docstring
+    # start_time 的 epoch 秒（本地时区，来源：控制台 startTime 或 CSV 导入解析）。
+    # Why 冗余一列：start_time 文本月日不补零，"2026/9/10" 与 "2026/9/2"
+    # 的字符串比较结果与时间先后不一致，无法在 SQL 里做区间过滤；
+    # 存 epoch 让"开课时间范围"筛选能直接在数据库侧走索引区间。
+    start_ts: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     creation_time: Mapped[str] = mapped_column(String(64), default="")
     # 课堂同步（sync_service）标记：True=由同步新增且尚未被任何任务纳入。
     # Why 单独一列而非比对 created_at：同步是幂等 upsert，"新增"只在
@@ -73,8 +78,46 @@ class Lesson(Base):
     # pending/downloading/success/failed —— 与引擎 course_status_callback 对齐
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)  # 仪表盘按状态 GROUP BY → 索引
     message: Mapped[str] = mapped_column(String(255), default="")  # 最近一次结果说明（"完成：4/4"）
+    # ---- 控制台「课堂管理」页同步（course_service）拉取的网站元数据 ----
+    # 这些字段只由同步写、展示用；与 CSV 导入的字段互不覆盖（同步按 lesson_id upsert）。
+    unit: Mapped[str] = mapped_column(String(255), default="")          # 单元主题
+    end_time: Mapped[str] = mapped_column(String(64), default="")       # 结束时间（原文）
+    duration: Mapped[int] = mapped_column(Integer, default=0)           # 课堂时长（秒）
+    teacher_name: Mapped[str] = mapped_column(String(128), default="")  # 授课教师
+    class_status: Mapped[int] = mapped_column(Integer, default=-1)      # 网站课堂状态枚举
+    record_state: Mapped[int] = mapped_column(Integer, default=-1)      # 云端录课（0无/1有）
+    live_state: Mapped[int] = mapped_column(Integer, default=-1)        # 直播/回放状态
+    website_synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # 上次从网站同步该行的时间
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Course(Base):
+    """班级/课程（来自教学管理「班级管理」页接口 /course/web/list）。
+
+    Why 单独一张表而不是复用 lessons：控制台把"班级/课程"（courseId，
+    即本系统的 class_id）与"课堂"（classId，即 lesson_id）分成两个页面、
+    两套接口、两种粒度；本系统也按页面拆成 courses / lessons 两张表，
+    避免把"班级级汇总"和"课堂级明细"塞进同一行靠字段区分。
+    """
+
+    __tablename__ = "courses"
+    __table_args__ = (UniqueConstraint("course_id", name="uq_courses_course_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    course_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    course_name: Mapped[str] = mapped_column(String(255), default="", index=True)
+    teacher_name: Mapped[str] = mapped_column(String(128), default="")   # 主讲教师
+    creator_name: Mapped[str] = mapped_column(String(128), default="")   # 创建人
+    class_total: Mapped[int] = mapped_column(Integer, default=0)         # 课堂总数（totalClassNum）
+    complete_class_num: Mapped[int] = mapped_column(Integer, default=0)  # 已完成课堂数
+    student_num: Mapped[int] = mapped_column(Integer, default=0)
+    course_state: Mapped[int] = mapped_column(Integer, default=-1)       # 网站班级状态枚举
+    first_class_begin_time: Mapped[str] = mapped_column(String(64), default="")  # 开课时间（首课）
+    end_time: Mapped[str] = mapped_column(String(64), default="")        # 结束时间
+    add_time: Mapped[str] = mapped_column(String(64), default="")        # 创建时间
+    cat_name: Mapped[str] = mapped_column(String(128), default="")       # 分类（catInfo 尽力取值）
+    synced_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)  # 上次同步时间
 
 
 class DownloadTask(Base):
@@ -195,4 +238,8 @@ class AppSetting(Base):
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_sync_status: Mapped[str] = mapped_column(String(16), default="")  # ""/success/failed
     last_sync_message: Mapped[str] = mapped_column(Text, default="")
+    # 控制台账号密码：备用（控制台登录含图形/滑块验证码，当前不做自动登录），
+    # 目标场景是"Cookie 失效时提醒用户 + 手工重新登录"，账号密码先存库备用
+    classin_account: Mapped[str] = mapped_column(Text, default="")
+    classin_password: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -17,6 +17,7 @@ from openpyxl import load_workbook
 from sqlalchemy.orm import Session
 
 from ..core.exceptions import ConflictError, NotFoundError, ValidationFailure
+from ..core.timeutil import parse_start_ts
 from ..db.models import Lesson
 from ..repositories import LessonRepo
 from ..schemas import ImportResultOut, LessonIn, LessonOut, LessonUpdateIn
@@ -42,7 +43,10 @@ def _normalize_rows(rows: list[dict]) -> list[dict]:
         lesson_id = item.get("课堂ID", "")
         if not lesson_id:
             continue  # Why 跳过：平台导出的表常见空行/汇总行，无课堂ID 无法下载
-        cleaned.append({field: item.get(col, "") for col, field in CSV_COLUMNS.items()})
+        row = {field: item.get(col, "") for col, field in CSV_COLUMNS.items()}
+        # 同步解析 start_ts：视频库"开课时间范围"筛选按 epoch 比较（见 models.Lesson）
+        row["start_ts"] = parse_start_ts(row.get("start_time"))
+        cleaned.append(row)
     return cleaned
 
 
@@ -130,7 +134,9 @@ class LessonService:
         最终靠 DB 约束拦下后者并抛 IntegrityError）。"""
         if self.repo.get_by_lesson_id(payload.lesson_id):
             raise ConflictError(f"课堂 {payload.lesson_id} 已存在")
-        lesson = self.repo.add(Lesson(**payload.model_dump()))
+        data = payload.model_dump()
+        data["start_ts"] = parse_start_ts(data.get("start_time"))
+        lesson = self.repo.add(Lesson(**data))
         self.repo.commit()
         return lesson
 
@@ -140,8 +146,11 @@ class LessonService:
         lesson = self.repo.get(lesson_id)
         if not lesson:
             raise NotFoundError("课堂不存在")
-        for key, value in payload.model_dump(exclude_unset=True).items():
+        changes = payload.model_dump(exclude_unset=True)
+        for key, value in changes.items():
             setattr(lesson, key, value)
+        if "start_time" in changes:  # 时间改了同步刷新 epoch，否则筛选会用旧值
+            lesson.start_ts = parse_start_ts(lesson.start_time)
         self.repo.commit()
         return lesson
 

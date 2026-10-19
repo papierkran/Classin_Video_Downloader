@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from ..core.config import settings as app_settings
 from ..core.exceptions import ConflictError, NotFoundError, ValidationFailure
+from ..core.fsutil import db_path, display_name, fsencode_key, fs_path
 from ..db.database import SessionLocal
 from ..db.models import AppSetting, DownloadLog, DownloadTask, Lesson, TaskItem, VideoAsset
 from ..engine import videodownloader
@@ -494,7 +495,7 @@ def _on_video_status(db: Session, runtime: TaskRuntime, event: dict) -> None:
                 VideoAsset.lesson_id == lesson_id, VideoAsset.source_key == source_key,
             )).first()
             path_asset = db.scalars(select(VideoAsset).where(
-                VideoAsset.lesson_id == lesson_id, VideoAsset.file_path == str(event.get("path") or ""),
+                VideoAsset.lesson_id == lesson_id, VideoAsset.file_path == db_path(str(event.get("path") or "")),
             )).first()
             # 迁移旧文件按路径建过行（source_key=legacy:…），重新下载同一片段
             # 会命中两条：保留按业务身份建的行，删掉按路径建的那条，防止重复
@@ -512,12 +513,13 @@ def _on_video_status(db: Session, runtime: TaskRuntime, event: dict) -> None:
             asset.title = str(video.get("segment_title") or "")[:255]
             asset.record_date = str(video.get("record_date") or "")[:64]
             asset.record_method = str(video.get("record_method") or "")[:64]
-            asset.file_path = str(event.get("path") or "")[:1024]
+            asset.file_path = db_path(str(event.get("path") or ""))[:1024]
             asset.status = status
             asset.percent = max(0, min(100, int(event.get("percent") or 0)))
             asset.error = str(event.get("error") or "")[:1000]
+            real_path = fs_path(asset.file_path)
             try:
-                asset.size_bytes = os.path.getsize(asset.file_path) if asset.file_path and os.path.isfile(asset.file_path) else 0
+                asset.size_bytes = os.path.getsize(real_path) if real_path and os.path.isfile(real_path) else 0
             except OSError:
                 asset.size_bytes = 0
             db.commit()
@@ -617,9 +619,11 @@ def scan_existing_video_files(db: Session, root: str) -> dict[str, int]:
                 unmatched += 1
                 continue
             match = matches[0]
-            path_key = hashlib.sha256(f"legacy:{match.lesson_id}:{full_path}".encode("utf-8")).hexdigest()
+            # 路径可能含非 UTF-8 代理字节：fsencode 成字节再哈希，避免编码异常
+            path_key = hashlib.sha256(fsencode_key("legacy", safe(match.lesson_id), full_path)).hexdigest()
+            stored_path = db_path(full_path)
             asset = db.scalars(select(VideoAsset).where(
-                VideoAsset.lesson_id == match.lesson_id, VideoAsset.file_path == full_path,
+                VideoAsset.lesson_id == match.lesson_id, VideoAsset.file_path == stored_path,
             )).first()
             if asset is None:
                 asset = VideoAsset(lesson_id=match.lesson_id, source_key=path_key)
@@ -627,8 +631,8 @@ def scan_existing_video_files(db: Session, root: str) -> dict[str, int]:
                 indexed += 1
             else:
                 existing += 1
-            asset.title = os.path.splitext(filename)[0][:255]
-            asset.file_path = full_path
+            asset.title = display_name(os.path.splitext(filename)[0])[:255]
+            asset.file_path = stored_path
             asset.status = "skipped" if size else "failed"
             asset.percent = 100 if size else 0
             asset.size_bytes = size
@@ -736,8 +740,9 @@ def _finalize(db: Session, runtime: TaskRuntime, error_msg: str) -> None:
             for asset in incomplete:
                 asset.status = "failed"
                 asset.error = (error or "任务结束时下载未完成")[:1000]
+                real_path = fs_path(asset.file_path)
                 try:
-                    asset.size_bytes = os.path.getsize(asset.file_path) if asset.file_path and os.path.isfile(asset.file_path) else 0
+                    asset.size_bytes = os.path.getsize(real_path) if real_path and os.path.isfile(real_path) else 0
                 except OSError:
                     asset.size_bytes = 0
             # 只有成功才置满：失败/取消保留实际进度供排查（进度条停在

@@ -271,6 +271,10 @@ class SettingsOut(BaseModel):
     speed_limit: int = 0
     skip_existing: bool = True
     headless: bool = False
+    # ClassIn 控制台账号密码：仅存库备用（当前不做自动登录），密码同样只回脱敏值
+    classin_account: str = ""
+    classin_password_masked: str = ""
+    has_classin_password: bool = False
 
 
 class SettingsUpdateIn(BaseModel):
@@ -289,6 +293,9 @@ class SettingsUpdateIn(BaseModel):
     speed_limit: int | None = Field(default=None, ge=0, le=100_000)
     skip_existing: bool | None = None
     headless: bool | None = None
+    # 控制台账号密码（备用）。空串=不修改，与 cookie 同一约定；不做格式强校验
+    classin_account: str | None = Field(default=None, max_length=128)
+    classin_password: str | None = Field(default=None, max_length=128)
 
     @field_validator("save_dir")
     @classmethod
@@ -369,6 +376,98 @@ class SyncStatusOut(BaseModel):
     last_sync_status: str = ""
     last_sync_message: str = ""
     pending_count: int = 0
+
+
+# ---------- 控制台同步（课程/课堂 + 网站对比） ----------
+
+
+class CourseOut(BaseModel):
+    """班级/课程行（「班级管理」页同步落库的 courses 表）。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    course_id: str
+    course_name: str = ""
+    teacher_name: str = ""
+    creator_name: str = ""
+    class_total: int = 0
+    complete_class_num: int = 0
+    student_num: int = 0
+    course_state: int = -1
+    first_class_begin_time: str = ""
+    end_time: str = ""
+    add_time: str = ""
+    cat_name: str = ""
+    synced_at: datetime | None = None
+
+
+class LessonConsoleOut(LessonOut):
+    """「课堂管理」页行：课堂元数据 + 网站同步字段 + 本地下载对比。
+
+    download_state 由后端判定（none/partial/done/failed），前端直接上色；
+    downloaded_at 只在课堂级提供（"本地下载日期"），片段级不下发。
+    """
+
+    unit: str = ""
+    end_time: str = ""
+    duration: int = 0
+    teacher_name: str = ""
+    class_status: int = -1
+    record_state: int = -1
+    live_state: int = -1
+    website_synced_at: datetime | None = None
+    local_total: int = 0
+    local_done: int = 0
+    local_failed: int = 0
+    downloaded_at: datetime | None = None
+    download_state: str = "none"
+
+
+class SegmentOut(BaseModel):
+    """单个回放片段（网站 FileList 项 + 本地匹配结果）。
+
+    本地匹配以文件大小为主键（同一片段直链下载，字节数高度一致），
+    匹配不到时 local_id 为空 → 前端标"未下载"。
+    """
+
+    file_id: str = ""
+    title: str = ""
+    start_time: str = ""
+    end_time: str = ""
+    duration: int = 0           # 网站 Duration 字段实为「秒」（分片按 7200s 切分）
+    size_bytes: int = 0
+    status: int = 0            # 网站 Status：2=正常
+    source_type: int = 0
+    ext: str = ""              # CIDExt（如 camera.3）
+    downloaded: bool = False
+    local_status: str = ""
+    local_title: str = ""
+    local_id: int | None = None
+
+
+class LessonSegmentsOut(BaseModel):
+    """课堂片段级对比（展开行时按需拉取）。"""
+
+    lesson_id: str
+    course_id: str = ""
+    website_total: int = 0
+    local_total: int = 0
+    segments: list[SegmentOut] = Field(default_factory=list)
+    local_only: list[SegmentOut] = Field(default_factory=list)
+    message: str = ""
+
+
+class ConsoleSyncRunOut(BaseModel):
+    """一次"同步课程+课堂"的结果回执。"""
+
+    courses_fetched: int = 0
+    courses_created: int = 0
+    courses_updated: int = 0
+    lessons_fetched: int = 0
+    lessons_created: int = 0
+    lessons_updated: int = 0
+    message: str = ""
 
 
 # ---------- 仪表盘/引擎 ----------

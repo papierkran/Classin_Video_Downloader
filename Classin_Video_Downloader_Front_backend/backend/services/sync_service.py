@@ -358,10 +358,13 @@ class SyncService:
         return int(self.db.scalar(select(func.count()).select_from(Lesson).where(Lesson.sync_pending.is_(True))) or 0)
 
     def verify_cookie(self, cookie: str | None) -> CookieVerifyOut:
-        """验证顺序：草稿 → 同步专用 → 下载回退。覆盖"粘贴后先验再存"
-        与"不填时验证当前生效的那份"两种用户路径。"""
+        """验证顺序：草稿 → 系统设置里的登录 Cookie。
+
+        Cookie 已统一（同步与下载共用同一份，见 course_service._cookie）：
+        不再有"同步专用 Cookie"这一来源，"不填即验证当前生效的那份"。
+        """
         s = self._require()
-        target = (cookie or "").strip() or (s.sync_cookie or "").strip() or (s.cookie or "").strip()
+        target = (cookie or "").strip() or (s.cookie or "").strip()
         return verify_console_cookie(target)
 
     # ---------- 执行 ----------
@@ -381,11 +384,11 @@ class SyncService:
 
     def _run_locked(self) -> SyncRunOut:
         s = self._require()
-        # 凭据选择顺序固定为"同步专用 → 下载回退"：与配置页文案一致，
-        # 避免"配了同步 Cookie 却因为下载 Cookie 有效而困惑"
-        cookie = (s.sync_cookie or "").strip() or (s.cookie or "").strip()
+        # Cookie 统一在【系统设置】维护：与 course_service 的镜像同步同源，
+        # 不再有"同步专用 Cookie"的第二处入口
+        cookie = (s.cookie or "").strip()
         if not cookie:
-            raise ValidationFailure("尚未配置 Cookie：请在【同步管理】填写控制台 Cookie，或在【系统设置】配置下载 Cookie")
+            raise ValidationFailure("尚未配置 Cookie：请到【系统设置】填写登录 Cookie")
         try:
             rows = fetch_lessons(cookie, max(1, s.sync_days or 7))
             created, updated = self._upsert(rows)

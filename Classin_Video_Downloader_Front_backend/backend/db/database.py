@@ -72,6 +72,7 @@ def init_db() -> None:
 
     models.Base.metadata.create_all(bind=engine)
     _ensure_columns()
+    _backfill_lesson_start_ts()
     _seed_admin()
     _seed_default_settings()
 
@@ -82,13 +83,29 @@ def init_db() -> None:
 # 注：只加不减——模型删字段后旧库里的历史列保留（SQLite 无 DROP COLUMN
 # 时代遗留，SQLAlchemy 也不会读它们），不需要为此写"删列"迁移。
 _COLUMN_ADDITIONS = {
-    "lessons": [("sync_pending", "INTEGER NOT NULL DEFAULT 0")],
+    "lessons": [
+        ("sync_pending", "INTEGER NOT NULL DEFAULT 0"),
+        # 控制台「课堂管理」页同步拉取的网站元数据（见 models.Lesson）
+        ("unit", "VARCHAR(255) NOT NULL DEFAULT ''"),
+        ("end_time", "VARCHAR(64) NOT NULL DEFAULT ''"),
+        ("duration", "INTEGER NOT NULL DEFAULT 0"),
+        ("teacher_name", "VARCHAR(128) NOT NULL DEFAULT ''"),
+        ("class_status", "INTEGER NOT NULL DEFAULT -1"),
+        ("record_state", "INTEGER NOT NULL DEFAULT -1"),
+        ("live_state", "INTEGER NOT NULL DEFAULT -1"),
+        ("website_synced_at", "DATETIME"),
+        # start_time 的 epoch 秒（旧库回填见 _backfill_lesson_start_ts）
+        ("start_ts", "INTEGER"),
+    ],
     "app_settings": [
         ("sync_cookie", "TEXT NOT NULL DEFAULT ''"),
         ("sync_days", "INTEGER NOT NULL DEFAULT 7"),
         ("last_sync_at", "DATETIME"),
         ("last_sync_status", "VARCHAR(16) NOT NULL DEFAULT ''"),
         ("last_sync_message", "TEXT NOT NULL DEFAULT ''"),
+        # 控制台账号密码：备用于将来自动登录（当前仅存库 + Cookie 失效提醒）
+        ("classin_account", "TEXT NOT NULL DEFAULT ''"),
+        ("classin_password", "TEXT NOT NULL DEFAULT ''"),
     ],
 }
 
@@ -106,6 +123,31 @@ def _ensure_columns() -> None:
                 if name not in existing:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
                     logger.info("数据库迁移：%s + %s", table, name)
+
+
+def _backfill_lesson_start_ts() -> None:
+    """给旧库的 lessons 回填 start_ts（从 start_time 文本解析）。
+
+    Why 在启动时做而不是惰性：视频库"开课时间范围"筛选依赖 start_ts，
+    旧数据（CSV 导入的历史行）没有这一列值就永远筛不出来；一次性回填
+    成本极低（仅处理 start_ts 为空的行），之后每次启动都是空转。
+    """
+    from sqlalchemy import select as _select
+
+    from ..core.timeutil import parse_start_ts
+    from . import models
+
+    with SessionLocal() as db:
+        rows = list(db.scalars(_select(models.Lesson).where(models.Lesson.start_ts.is_(None), models.Lesson.start_time != "")).all())
+        filled = 0
+        for lesson in rows:
+            ts = parse_start_ts(lesson.start_time)
+            if ts is not None:
+                lesson.start_ts = ts
+                filled += 1
+        if filled:
+            db.commit()
+            logger.info("数据库回填：lessons.start_ts %d 行", filled)
 
 
 def _seed_admin() -> None:

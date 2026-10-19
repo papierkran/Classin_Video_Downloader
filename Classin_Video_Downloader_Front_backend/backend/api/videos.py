@@ -18,7 +18,7 @@ from __future__ import annotations
 import mimetypes
 import os
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote_from_bytes
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import StreamingResponse
@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from ..core.exceptions import AuthError, ConflictError, NotFoundError
 from ..core.config import settings
+from ..core.fsutil import fs_path
 from ..core.security import create_media_token, decode_media_token
 from ..db.models import AppSetting, DownloadTask, Lesson, User, VideoAsset
 from ..schemas import MediaTicketOut, PageOut, TaskCreateIn, TaskOut, VideoOut
@@ -53,24 +54,36 @@ def scan_video_files(_: User = Depends(current_user), db: Session = Depends(db_s
     return {**result, "message": "扫描完成"}
 
 
+def _class_group_expr():
+    """视频库的班级分组键：有平台班级 ID 用 ID，否则退化为 "name:班级名"。
+
+    Why 不一概用名称：名称可被人工修正，有 ID 时用 ID 做键，
+    改名不会把同一班拆成两行。
+    """
+    return case(
+        (Lesson.class_id.is_not(None) & (Lesson.class_id != ""), Lesson.class_id),
+        else_=(literal("name:") + func.coalesce(Lesson.class_name, "未命名班级")),
+    )
+
+
 @router.get("/classes")
 def list_video_classes(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
     keyword: str = "",
+    class_key: str = "",
+    status: str = "",
+    start_from: int | None = Query(default=None, description="开课时间下限（epoch 秒）"),
+    start_to: int | None = Query(default=None, description="开课时间上限（epoch 秒）"),
     _: User = Depends(current_user),
     db: Session = Depends(db_session),
 ):
-    """视频库一级列表：按班级汇总课堂数、片段数、状态和总大小。
+    """视频库一级列表：按班级汇总课堂数、片段数、状态和总大小（含筛选）。
 
-    分组键（class_group）：有平台班级 ID 用 ID；手工录入没有 ID 的
-    退化为 "name:班级名"。Why 不一概用名称：名称可被人工修正，
-    有 ID 时用 ID 做键，改名不会把同一班拆成两行。
+    筛选与分页口径一致：所有 where 都作用在同一 stmt 上，count 复用同一
+    条件（见下方 grouped 子查询），不会出现"筛了之后总数对不上翻页"。
     """
-    class_group = case(
-        (Lesson.class_id.is_not(None) & (Lesson.class_id != ""), Lesson.class_id),
-        else_=(literal("name:") + func.coalesce(Lesson.class_name, "未命名班级")),
-    )
+    class_group = _class_group_expr()
     stmt = select(
         func.max(Lesson.class_id).label("class_id"),
         func.max(Lesson.class_name).label("class_name"),
@@ -83,6 +96,26 @@ def list_video_classes(
     if keyword.strip():
         pattern = f"%{keyword.strip()}%"
         stmt = stmt.where(or_(Lesson.class_name.ilike(pattern), Lesson.class_id.ilike(pattern), Lesson.lesson_name.ilike(pattern), Lesson.lesson_id.ilike(pattern)))
+    if class_key:
+        if class_key.startswith("name:"):
+            stmt = stmt.where(or_(Lesson.class_id.is_(None), Lesson.class_id == ""), Lesson.class_name == class_key[5:])
+        else:
+            stmt = stmt.where(Lesson.class_id == class_key)
+    if start_from is not None:
+        stmt = stmt.where(Lesson.start_ts.is_not(None), Lesson.start_ts >= start_from)
+    if start_to is not None:
+        stmt = stmt.where(Lesson.start_ts.is_not(None), Lesson.start_ts <= start_to)
+    if status:
+        # 顶级"片段状态"筛选=至少含一个该状态视频的班级（不是只统计匹配片段，
+        # 保持行内 完成/失败 计数仍是整班口径，便于判断整体情况）
+        matched = (
+            select(class_group)
+            .select_from(Lesson)
+            .outerjoin(VideoAsset, VideoAsset.lesson_id == Lesson.lesson_id)
+            .where(VideoAsset.status == status)
+            .distinct()
+        )
+        stmt = stmt.where(class_group.in_(matched))
 
     # 总数不能用 len(rows)：班级分组是聚合结果，这里把同一 stmt 收窄成
     # "只取分组键"的子查询再 count——条件一致，总数与翻页口径永远对齐。
@@ -101,6 +134,26 @@ def list_video_classes(
             "size_bytes": int(size_bytes or 0),
         })
     return {"total": total, "page": page, "page_size": page_size, "items": items}
+
+
+@router.get("/class-options")
+def list_class_options(_: User = Depends(current_user), db: Session = Depends(db_session)):
+    """班级下拉选项（视频库筛选用）。返回去重后的 {class_key, class_id, class_name}。"""
+    class_group = _class_group_expr()
+    stmt = (
+        select(
+            class_group.label("class_key"),
+            func.max(Lesson.class_id).label("class_id"),
+            func.max(Lesson.class_name).label("class_name"),
+        )
+        .select_from(Lesson)
+        .group_by(class_group)
+        .order_by(func.max(Lesson.class_name))
+    )
+    return [
+        {"class_key": key, "class_id": class_id or "", "class_name": class_name or "未命名班级"}
+        for key, class_id, class_name in db.execute(stmt).all()
+    ]
 
 
 @router.get("/classes/{class_key}/lessons")
@@ -199,7 +252,7 @@ def create_play_ticket(video_id: int, request: Request, response: Response, _: U
     asset = db.get(VideoAsset, video_id)
     # 只放行"确实有文件"的记录：状态没到 success/skipped 或文件被外部
     # 删除时，早早 404 比发一个必然会 404 的票据更省一次往返。
-    if not asset or asset.status not in ("success", "skipped") or not asset.file_path or not os.path.isfile(asset.file_path):
+    if not asset or asset.status not in ("success", "skipped") or not asset.file_path or not os.path.isfile(fs_path(asset.file_path)):
         raise NotFoundError("视频文件不存在或尚未下载完成")
     token = create_media_token(video_id)
     response.set_cookie(
@@ -228,7 +281,7 @@ def stream_video(video_id: int, request: Request, download: bool = False, db: Se
     asset = db.get(VideoAsset, video_id)
     if not asset or asset.status not in ("success", "skipped") or not asset.file_path:
         raise NotFoundError("视频文件不存在或尚未下载完成")
-    path = Path(asset.file_path).resolve()
+    path = Path(fs_path(asset.file_path)).resolve()
     if not path.is_file():
         raise NotFoundError("视频文件已从服务器移除")
     size = path.stat().st_size
@@ -278,7 +331,10 @@ def stream_video(video_id: int, request: Request, download: bool = False, db: Se
 
     media_type = mimetypes.guess_type(path.name)[0] or "video/mp4"
     disposition = "attachment" if download else "inline"
-    headers["Content-Disposition"] = f"{disposition}; filename*=UTF-8''{quote(path.name)}"
+    # filename 可能含非 UTF-8 代理字节，quote() 直接编码会抛异常；
+    # 先 fsencode 成字节再按 RFC 5987 百分号编码，任何字节都能安全下发。
+    encoded_name = quote_from_bytes(os.fsencode(path.name))
+    headers["Content-Disposition"] = f"{disposition}; filename*=UTF-8''{encoded_name}"
     return StreamingResponse(chunks(), status_code=status_code, media_type=media_type, headers=headers)
 
 

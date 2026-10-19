@@ -48,7 +48,7 @@ const app = createApp({
     const loginLoading = ref(false);
     const view = ref('dashboard');
 
-    const viewTitle = computed(() => ({ dashboard: '仪表盘', lessons: '课堂管理', tasks: '下载任务', videos: '视频库', sync: '同步管理', settings: '系统设置' }[view.value]));
+    const viewTitle = computed(() => ({ dashboard: '仪表盘', lessons: '课堂管理', tasks: '下载任务', videos: '视频库', sync: '班级同步', settings: '系统设置' }[view.value]));
 
     async function doLogin() {
       if (!loginForm.username || !loginForm.password) return ElementPlus.ElMessage.warning('请输入账号密码');
@@ -78,23 +78,44 @@ const app = createApp({
     const lessons = ref([]);
     const selectedLessons = ref([]);
     const lessonLoading = ref(false);
-    const lessonQuery = reactive({ page: 1, page_size: 20, total: 0, keyword: '', status: '' });
+    const lessonQuery = reactive({ page: 1, page_size: 20, total: 0, keyword: '', download_state: '' });
     const lessonDialog = reactive({ visible: false, form: {} });
     const importVisible = ref(false);
     const importFile = ref(null);
     const importing = ref(false);
     const lessonDownloadId = ref(null);
+    // 片段级对比：按课堂 id 缓存（展开行时拉 /api/console/lessons/{id}/segments）
+    const segmentData = reactive({});
+    const segmentLoading = reactive({});
 
     async function loadLessons(page) {
       if (page) lessonQuery.page = page;
       lessonLoading.value = true;
       try {
-        const q = new URLSearchParams({ page: lessonQuery.page, page_size: lessonQuery.page_size, keyword: lessonQuery.keyword, status: lessonQuery.status });
-        const data = await api('/api/lessons?' + q);
+        // 走控制台视图接口：同一行同时带网站元数据 + 本地下载对比字段
+        const q = new URLSearchParams({ page: lessonQuery.page, page_size: lessonQuery.page_size, keyword: lessonQuery.keyword, download_state: lessonQuery.download_state });
+        const data = await api('/api/console/lessons?' + q);
         lessons.value = data.items;
         lessonQuery.total = data.total;
       } finally { lessonLoading.value = false; }
     }
+
+    async function loadSegments(row, force) {
+      if (!force && segmentData[row.id]) return;
+      segmentLoading[row.id] = true;
+      try {
+        segmentData[row.id] = await api(`/api/console/lessons/${row.id}/segments`);
+      } finally { segmentLoading[row.id] = false; }
+    }
+
+    function durationText(sec) {
+      if (!sec) return '—';
+      const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+      return h ? `${h} 时 ${m} 分` : `${m} 分`;
+    }
+
+    function downloadStateZh(s) { return { none: '未下载', partial: '部分下载', done: '已下载', failed: '下载失败' }[s] || '未下载'; }
+    function downloadStateTag(s) { return { none: 'info', partial: 'warning', done: 'success', failed: 'danger' }[s] || 'info'; }
 
     function openLessonDialog(row) {
       // 编辑/新增共用一个表单（row=null 为新增），减少一个组件文件
@@ -176,19 +197,41 @@ const app = createApp({
     const lessonVideoLoading = reactive({});
     const videoLoading = ref(false);
     const scanningVideos = ref(false);
-    const videoQuery = reactive({ page: 1, page_size: 20, total: 0, keyword: '', status: '' });
+    const videoQuery = reactive({ page: 1, page_size: 20, total: 0, keyword: '', status: '', class_key: '', dateRange: [] });
+    const videoClassOptions = ref([]);
     const videoPlayer = reactive({ visible: false, title: '', url: '', id: 0 });
     let playbackTimer = null;
+
+    // 开课时间范围 → epoch 秒（与后端 lessons.start_ts 同口径，本地时区）：
+    // 起=当天 00:00、止=当天 23:59:59，符合"截止日期含当天"的直觉。
+    function rangeToEpoch(dates) {
+      if (!dates || dates.length !== 2) return {};
+      const from = Math.floor(new Date(dates[0] + 'T00:00:00').getTime() / 1000);
+      const to = Math.floor(new Date(dates[1] + 'T23:59:59').getTime() / 1000);
+      return { start_from: from, start_to: to };
+    }
 
     async function loadVideos(page) {
       if (page) videoQuery.page = page;
       videoLoading.value = true;
       try {
-        const q = new URLSearchParams({ page: videoQuery.page, page_size: videoQuery.page_size, keyword: videoQuery.keyword, status: videoQuery.status });
+        const range = rangeToEpoch(videoQuery.dateRange);
+        const q = new URLSearchParams({ page: videoQuery.page, page_size: videoQuery.page_size, keyword: videoQuery.keyword, status: videoQuery.status, class_key: videoQuery.class_key });
+        if (range.start_from) q.set('start_from', range.start_from);
+        if (range.start_to) q.set('start_to', range.start_to);
         const data = await api('/api/videos/classes?' + q);
         videoClasses.value = data.items;
         videoQuery.total = data.total;
       } finally { videoLoading.value = false; }
+    }
+
+    async function loadVideoClassOptions() {
+      try { videoClassOptions.value = await api('/api/videos/class-options'); } catch (e) { /* 已提示 */ }
+    }
+
+    function resetVideoFilters() {
+      videoQuery.keyword = ''; videoQuery.status = ''; videoQuery.class_key = ''; videoQuery.dateRange = [];
+      loadVideos(1);
     }
 
     async function onClassExpand(row, expandedRows) {
@@ -274,8 +317,10 @@ const app = createApp({
     const taskLoading = ref(false);
     const taskQuery = reactive({ page: 1, page_size: 20, total: 0, status: '' });
     const taskDialog = reactive({ visible: false, name: '', scope: 'all', save_dir: '' });
-    const detail = reactive({ visible: false, task: { id: 0, items: [], status: '' }, logs: [], tab: 'items', lastLogId: 0 });
+    const detail = reactive({ visible: false, task: { id: 0, items: [], status: '' }, logs: [], tab: 'items', lastLogId: 0, onlyFailed: false });
     let pollTimer = null;
+    // 失败课堂列表（置顶展示 + "只看失败"过滤共用同一份计算结果）
+    const failedItems = computed(() => (detail.task.items || []).filter(i => i.status === 'failed'));
 
     async function loadTasks(page) {
       if (page) taskQuery.page = page;
@@ -332,6 +377,7 @@ const app = createApp({
       detail.task = { id: row.id, name: row.name || '', status: row.status || 'created', items: [], percent: 0, speed_mbps: 0, error: '' };
       detail.visible = true;
       detail.tab = 'items';
+      detail.onlyFailed = false;
       detail.lastLogId = 0;
       detail.logs = [];
       await refreshDetail();
@@ -360,8 +406,8 @@ const app = createApp({
     watch(() => detail.visible, (v) => { if (!v) stopPoll(); });
 
     /* ===== 设置 ===== */
-    const settingsSaved = reactive({ cookie_masked: '', has_cookie: false, save_dir: '', driver_path: '', max_workers: 4, speed_limit: 0, skip_existing: true, headless: false });
-    const settingsForm = reactive({ cookie: '', save_dir: '', driver_path: '', max_workers: 4, speed_limit: 0, skip_existing: true, headless: false });
+    const settingsSaved = reactive({ cookie_masked: '', has_cookie: false, save_dir: '', driver_path: '', max_workers: 4, speed_limit: 0, skip_existing: true, headless: false, classin_account: '', classin_password_masked: '', has_classin_password: false });
+    const settingsForm = reactive({ cookie: '', save_dir: '', driver_path: '', max_workers: 4, speed_limit: 0, skip_existing: true, headless: false, classin_account: '', classin_password: '' });
     const engineInfo = reactive({ browser: '', driver_path: '', driver_ready: false });
     const verifying = ref(false);
     const cookieCheckMsg = ref('');
@@ -403,7 +449,8 @@ const app = createApp({
         Object.assign(settingsSaved, s);
         // cookie 不回显明文：表单只留空，保存时传了才覆盖
         settingsForm.cookie = '';
-        Object.assign(settingsForm, { save_dir: s.save_dir, driver_path: s.driver_path, max_workers: s.max_workers, speed_limit: s.speed_limit, skip_existing: s.skip_existing, headless: s.headless });
+        settingsForm.classin_password = ''; // 密码同样不回显
+        Object.assign(settingsForm, { save_dir: s.save_dir, driver_path: s.driver_path, max_workers: s.max_workers, speed_limit: s.speed_limit, skip_existing: s.skip_existing, headless: s.headless, classin_account: s.classin_account || '' });
       } catch (e) { /* 403 非管理员 */ }
     }
 
@@ -411,9 +458,12 @@ const app = createApp({
       const body = { save_dir: settingsForm.save_dir, driver_path: settingsForm.driver_path, max_workers: settingsForm.max_workers,
         speed_limit: settingsForm.speed_limit, skip_existing: settingsForm.skip_existing, headless: settingsForm.headless };
       if (settingsForm.cookie.trim()) body.cookie = settingsForm.cookie.trim(); // 只有填写了才提交，避免空串清空
+      body.classin_account = settingsForm.classin_account;                       // 账号允许多次提交（覆盖）
+      if (settingsForm.classin_password.trim()) body.classin_password = settingsForm.classin_password.trim();
       const s = await api('/api/settings', { method: 'PUT', body: JSON.stringify(body) });
       Object.assign(settingsSaved, s);
       settingsForm.cookie = '';
+      settingsForm.classin_password = '';
       ElementPlus.ElMessage.success('配置已保存');
     }
 
@@ -445,6 +495,96 @@ const app = createApp({
     const syncDownloading = ref(false);
     const syncCheckMsg = ref('');
     const syncCheckClass = ref('hint');
+    // 控制台同步（课程/课堂）与"班级/课程列表"
+    const consoleSyncing = ref(false);
+    const courses = ref([]);
+    const courseLoading = ref(false);
+    const courseQuery = reactive({ page: 1, page_size: 20, total: 0, keyword: '' });
+    // 班级展开：按 course_id 缓存该班课堂 + 勾选行 + 下载中的班级
+    const courseLessons = reactive({});
+    const courseLessonLoading = reactive({});
+    const courseSelected = reactive({});
+    const courseDownloadingId = ref(null);
+    // Cookie 失效提示：上次同步失败且文案含过期/未登录关键词
+    const cookieExpired = computed(() => /过期|未登录|失效/.test(syncStatus.last_sync_message || ''));
+
+    async function loadCourses(page) {
+      if (page) courseQuery.page = page;
+      courseLoading.value = true;
+      try {
+        const q = new URLSearchParams({ page: courseQuery.page, page_size: courseQuery.page_size, keyword: courseQuery.keyword });
+        const data = await api('/api/console/courses?' + q);
+        courses.value = data.items;
+        courseQuery.total = data.total;
+      } finally { courseLoading.value = false; }
+    }
+
+    async function loadCourseLessons(row, force) {
+      const key = row.course_id;
+      if (!force && courseLessons[key]) return;
+      courseLessonLoading[key] = true;
+      try {
+        const q = new URLSearchParams({ class_id: key, page: 1, page_size: 200 });
+        const data = await api('/api/console/lessons?' + q);
+        courseLessons[key] = data.items;
+      } finally { courseLessonLoading[key] = false; }
+    }
+
+    function onCourseExpand(row, expandedRows) {
+      const expanded = expandedRows.some(item => item.course_id === row.course_id);
+      if (expanded) loadCourseLessons(row).catch(() => {});
+    }
+
+    // 打开任务详情：下载入口统一跳任务页并展开详情（与课堂管理页一致）
+    async function openStartedTask(taskId) {
+      loadTasks(1);
+      loadStats();
+      view.value = 'tasks';
+      await openTaskDetail({ id: taskId });
+    }
+
+    async function downloadCourse(row) {
+      courseDownloadingId.value = row.course_id;
+      let task;
+      try {
+        task = await api(`/api/console/courses/${encodeURIComponent(row.course_id)}/download`, { method: 'POST' });
+        ElementPlus.ElMessage.success(`班级「${row.course_name}」下载任务 #${task.id} 已启动`);
+        await openStartedTask(task.id);
+      } catch (e) { /* api() 已提示 */ }
+      finally { courseDownloadingId.value = null; }
+    }
+
+    async function downloadCourseSelectedLessons(row) {
+      const sel = courseSelected[row.course_id] || [];
+      if (!sel.length) return;
+      let task;
+      try {
+        task = await api('/api/tasks', { method: 'POST', body: JSON.stringify({
+          name: `下载：${row.course_name || row.course_id}（${sel.length} 节）`,
+          lesson_ids: sel.map(l => l.id),
+        }) });
+        try {
+          await api(`/api/tasks/${task.id}/start`, { method: 'POST' });
+          ElementPlus.ElMessage.success(`已创建任务 #${task.id} 并启动`);
+        } catch (e) {
+          ElementPlus.ElMessage.warning(`任务 #${task.id} 已创建但启动失败，可在下载任务页手动启动`);
+        }
+        await openStartedTask(task.id);
+      } catch (e) { /* api() 已提示 */ }
+    }
+
+    async function runConsoleSync() {
+      consoleSyncing.value = true;
+      try {
+        const r = await api('/api/console/sync', { method: 'POST' });
+        ElementPlus.ElMessage.success(r.message || '同步完成');
+        loadSync();       // 刷新状态卡
+        loadCourses(1);   // 刷新班级/课程列表
+        loadLessons(1);   // 刷新课堂列表（含下载对比）
+        loadStats();
+      } catch (e) { /* api() 已提示（如"同步正在进行中"、Cookie 过期） */ }
+      finally { consoleSyncing.value = false; }
+    }
 
     async function loadSync() {
       try {
@@ -541,8 +681,8 @@ const app = createApp({
     /* ===== 视图切换（顺带按需拉数据） ===== */
     function switchLessons() { view.value = 'lessons'; loadLessons(1); }
     function switchTasks() { view.value = 'tasks'; loadTasks(1); }
-    function switchVideos() { view.value = 'videos'; loadVideos(1); }
-    function switchSync() { view.value = 'sync'; loadSync(); }
+    function switchVideos() { view.value = 'videos'; loadVideos(1); if (!videoClassOptions.value.length) loadVideoClassOptions(); }
+    function switchSync() { view.value = 'sync'; loadSync(); loadCourses(1); }
 
     function statusZh(s) { return TASK_STATUS[s] || s; }
     function statusTag(s) { return { created: 'info', running: '', paused: 'warning', stopping: 'warning', success: 'success', failed: 'danger', cancelled: 'info' }[s] || 'info'; }
@@ -558,7 +698,7 @@ const app = createApp({
       loadStats();
       loadLessons(1);
       loadTasks(1);
-      if (user.role === 'admin') { loadSettings(); loadSync(); }
+      if (user.role === 'admin') { loadSettings(); loadSync(); loadCourses(1); }
     }
 
     onMounted(() => { if (authed.value) bootstrap(); });
@@ -570,15 +710,20 @@ const app = createApp({
       lessonDownloadId, downloadLesson,
       importVisible, importFile, importing, onImportFile, doImport,
       openLessonDialog, saveLesson, deleteLesson, batchDeleteLessons, loadLessons,
-      tasks, taskLoading, taskQuery, taskDialog, detail, TASK_STATUS,
+      segmentData, segmentLoading, loadSegments, durationText, downloadStateZh, downloadStateTag,
+      tasks, taskLoading, taskQuery, taskDialog, detail, failedItems, TASK_STATUS,
       loadTasks, openTaskDialog, createTask, taskAction, deleteTask, openTaskDetail,
       videos, videoClasses, classLessons, classLessonLoading, lessonVideos, lessonVideoLoading,
       videoLoading, videoQuery, videoPlayer, VIDEO_STATUS, loadVideos, onClassExpand, onLessonExpand, onVideoStatusChange,
+      videoClassOptions, loadVideoClassOptions, resetVideoFilters,
       playVideo, closeVideoPlayer, downloadVideo, retryVideo, scanVideos, scanningVideos,
       settingsSaved, settingsForm, engineInfo, verifying, cookieCheckMsg, cookieCheckClass,
       loadSettings, saveSettings, verifyCookie, loadEngine,
       syncSaved, syncForm, syncStatus, syncPending, syncSelected, syncPendingTable, syncing, syncVerifying, syncDownloading, syncCheckMsg, syncCheckClass,
       loadSync, saveSyncConfig, verifySyncCookie, runSyncNow, onSyncPendingSelect, downloadSelectedLessons,
+      courseQuery, courses, courseLoading, loadCourses, consoleSyncing, runConsoleSync, cookieExpired,
+      courseLessons, courseLessonLoading, courseSelected, courseDownloadingId,
+      loadCourseLessons, onCourseExpand, downloadCourse, downloadCourseSelectedLessons,
       dirPicker, openDirectoryPicker, browseDirectory, chooseDirectory,
       pwdDialog, changePassword, onUserCmd,
       switchLessons, switchTasks, switchVideos, switchSync, createTaskFromSelection: openTaskDialog,

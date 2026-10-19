@@ -62,6 +62,10 @@ class SettingService:
             speed_limit=s.speed_limit,
             skip_existing=s.skip_existing,
             headless=s.headless,
+            classin_account=s.classin_account or "",
+            # 密码只回固定长度的掩码，不泄露长度之外的任何信息
+            classin_password_masked="********" if s.classin_password else "",
+            has_classin_password=bool(s.classin_password),
         )
 
     def update(self, payload: SettingsUpdateIn) -> SettingsOut:
@@ -77,6 +81,14 @@ class SettingService:
         cookie = data.pop("cookie", None)
         if cookie:
             s.cookie = cookie.strip()
+
+        # 账号密码与 cookie 同一约定：空串=不修改（表单回车带上的空值不能误清）
+        account = data.pop("classin_account", None)
+        if account is not None and account.strip():
+            s.classin_account = account.strip()
+        password = data.pop("classin_password", None)
+        if password is not None and password.strip():
+            s.classin_password = password.strip()
 
         save_dir = data.get("save_dir")
         if save_dir is not None:

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ClassIn 视频下载管理系统</title>
   <link rel="stylesheet" href="/static/vendor/element-plus.css">
-  <link rel="stylesheet" href="/static/styles.css?v=20261014-video-library">
+  <link rel="stylesheet" href="/static/styles.css?v=20261019-video-library">
 </head>
 <body>
 <div id="app" v-cloak>
@@ -33,10 +33,10 @@
       <div class="side-logo">📥 ClassIn 下载管理</div>
       <div class="side-menu">
         <div class="side-item" :class="{on: view==='dashboard'}" @click="view='dashboard'">📊 仪表盘</div>
+                <div class="side-item" :class="{on: view==='sync'}" @click="switchSync">🏫 班级同步</div>
         <div class="side-item" :class="{on: view==='lessons'}" @click="switchLessons">📚 课堂管理</div>
         <div class="side-item" :class="{on: view==='tasks'}" @click="switchTasks">🎬 下载任务</div>
         <div class="side-item" :class="{on: view==='videos'}" @click="switchVideos">▶️ 视频库</div>
-        <div class="side-item" :class="{on: view==='sync'}" @click="switchSync">🔄 同步管理</div>
         <div class="side-item" :class="{on: view==='settings'}" @click="view='settings'">⚙️ 系统设置</div>
       </div>
       <div class="side-foot">v1.0 前后端一体版</div>
@@ -93,36 +93,67 @@
         <div v-show="view==='lessons'">
           <el-card shadow="never" class="mb12">
             <div class="toolbar">
-              <el-input v-model="lessonQuery.keyword" placeholder="搜索课堂/班级名称或ID" clearable style="width:260px" @keyup.enter="loadLessons(1)" @clear="loadLessons(1)"></el-input>
-              <el-select v-model="lessonQuery.status" placeholder="状态筛选" clearable style="width:150px" @change="loadLessons(1)">
-                <el-option label="待下载" value="pending"></el-option>
-                <el-option label="下载中" value="downloading"></el-option>
-                <el-option label="成功" value="success"></el-option>
-                <el-option label="失败" value="failed"></el-option>
+              <el-input v-model="lessonQuery.keyword" placeholder="搜索课堂/班级名称或ID" clearable style="width:240px" @keyup.enter="loadLessons(1)" @clear="loadLessons(1)"></el-input>
+              <el-select v-model="lessonQuery.download_state" placeholder="下载状态" clearable style="width:130px" @change="loadLessons(1)">
+                <el-option label="未下载" value="none"></el-option>
+                <el-option label="部分下载" value="partial"></el-option>
+                <el-option label="已下载" value="done"></el-option>
+                <el-option label="下载失败" value="failed"></el-option>
               </el-select>
               <el-button type="primary" @click="loadLessons(1)">查询</el-button>
               <div class="spacer"></div>
-              <el-button type="success" @click="importVisible=true">导入 CSV/XLSX</el-button>
+              <el-button type="success" :loading="consoleSyncing" @click="runConsoleSync">从网站同步</el-button>
+              <el-button @click="importVisible=true">导入 CSV/XLSX</el-button>
               <el-button type="primary" plain @click="openLessonDialog(null)">新增课堂</el-button>
               <el-button type="danger" plain :disabled="!selectedLessons.length" @click="batchDeleteLessons">删除所选</el-button>
               <el-button type="warning" :disabled="!selectedLessons.length" @click="createTaskFromSelection">从所选建任务</el-button>
             </div>
+            <div class="sub-text mt12" v-if="syncStatus.last_sync_status==='failed' && cookieExpired">
+              ⚠️ 上次同步失败，Cookie 可能已过期：请重新登录 ClassIn 控制台后到【系统设置】更新 Cookie。
+            </div>
           </el-card>
 
           <el-card shadow="never">
-            <el-table :data="lessons" v-loading="lessonLoading" @selection-change="selectedLessons=$event" size="large">
-              <el-table-column type="selection" width="48"></el-table-column>
-              <el-table-column prop="lesson_id" label="课堂ID" width="130"></el-table-column>
-              <el-table-column prop="class_name" label="班级名称" min-width="170" show-overflow-tooltip></el-table-column>
-              <el-table-column prop="lesson_name" label="课堂名称" min-width="200" show-overflow-tooltip></el-table-column>
-              <el-table-column prop="start_time" label="开课时间" width="165"></el-table-column>
-              <el-table-column label="状态" width="100">
+            <el-table :data="lessons" v-loading="lessonLoading" @selection-change="selectedLessons=$event" size="large" row-key="id">
+              <el-table-column type="expand" width="46">
                 <template #default="{row}">
-                  <el-tag :type="lessonStatusTag(row.status)">{{ lessonStatusZh(row.status) }}</el-tag>
+                  <div class="segment-compare" v-loading="segmentLoading[row.id]">
+                    <div class="segment-head">
+                      <span class="segment-title">回放片段对比</span>
+                      <span v-if="segmentData[row.id]">网站 <b>{{ segmentData[row.id].website_total }}</b> 段 · 本地 <b>{{ segmentData[row.id].local_total }}</b> 段</span>
+                      <span v-else class="video-muted">展开即从网站拉取</span>
+                      <el-button size="small" text type="primary" @click="loadSegments(row, true)">刷新</el-button>
+                      <span class="hint bad" v-if="segmentData[row.id] && segmentData[row.id].message">{{ segmentData[row.id].message }}</span>
+                    </div>
+                    <el-table :data="segmentData[row.id] ? segmentData[row.id].segments : []" size="small" empty-text="网站没有回放片段（未录课或录课未生成）">
+                      <el-table-column label="网站片段" min-width="200">
+                        <template #default="{row:s}"><div>{{ s.title || '片段' }}</div><div class="video-meta">{{ s.start_time || '时间未知' }}<span v-if="s.ext"> · {{ s.ext }}</span></div></template>
+                      </el-table-column>
+                      <el-table-column label="时长" width="100"><template #default="{row:s}">{{ s.duration ? durationText(s.duration) : '—' }}</template></el-table-column>
+                      <el-table-column label="大小" width="110"><template #default="{row:s}">{{ formatBytes(s.size_bytes) }}</template></el-table-column>
+                      <el-table-column label="网站状态" width="100"><template #default="{row:s}"><el-tag size="small" :type="s.status===2?'success':'info'">{{ s.status===2 ? '正常' : '状态'+s.status }}</el-tag></template></el-table-column>
+                      <el-table-column label="本地" width="110"><template #default="{row:s}"><el-tag size="small" :type="s.downloaded?'success':'danger'">{{ s.downloaded ? '已下载' : '未下载' }}</el-tag></template></el-table-column>
+                      <el-table-column label="本地文件" min-width="180" show-overflow-tooltip><template #default="{row:s}"><span v-if="s.local_title">{{ s.local_title }}</span><span v-else class="video-muted">—</span></template></el-table-column>
+                    </el-table>
+                    <div v-if="segmentData[row.id] && segmentData[row.id].local_only.length" class="segment-local-only">
+                      <span>本地多余片段（网站已无）：</span>
+                      <el-tag v-for="s in segmentData[row.id].local_only" :key="s.local_id" size="small" type="warning" class="mr6">{{ s.local_title || '片段' }}</el-tag>
+                    </div>
+                  </div>
                 </template>
               </el-table-column>
-              <el-table-column prop="message" label="备注" min-width="130" show-overflow-tooltip></el-table-column>
-              <el-table-column label="操作" width="205" fixed="right">
+              <el-table-column type="selection" width="46"></el-table-column>
+              <el-table-column prop="lesson_id" label="课堂ID" width="120"></el-table-column>
+              <el-table-column prop="class_name" label="所属班级" min-width="150" show-overflow-tooltip></el-table-column>
+              <el-table-column prop="lesson_name" label="课堂名称" min-width="180" show-overflow-tooltip></el-table-column>
+              <el-table-column prop="unit" label="单元主题" min-width="120" show-overflow-tooltip></el-table-column>
+              <el-table-column label="课堂时长" width="100"><template #default="{row}">{{ durationText(row.duration) }}</template></el-table-column>
+              <el-table-column prop="teacher_name" label="授课教师" width="100" show-overflow-tooltip></el-table-column>
+              <el-table-column prop="start_time" label="开课时间" width="150"></el-table-column>
+              <el-table-column label="录课" width="80"><template #default="{row}"><el-tag size="small" :type="row.record_state===1?'success':'info'">{{ row.record_state===1 ? '有录制' : '无录制' }}</el-tag></template></el-table-column>
+              <el-table-column label="下载状态" width="110"><template #default="{row}"><el-tag size="small" :type="downloadStateTag(row.download_state)">{{ downloadStateZh(row.download_state) }}<span v-if="row.local_total">（{{ row.local_done }}/{{ row.local_total }}）</span></el-tag></template></el-table-column>
+              <el-table-column label="下载日期" width="150"><template #default="{row}"><span v-if="row.downloaded_at">{{ fmtTime(row.downloaded_at) }}</span><span v-else class="video-muted">—</span></template></el-table-column>
+              <el-table-column label="操作" width="180" fixed="right">
                 <template #default="{row}">
                   <el-button link type="success" :loading="lessonDownloadId===row.id" @click="downloadLesson(row)">下载</el-button>
                   <el-button link type="primary" @click="openLessonDialog(row)">编辑</el-button>
@@ -142,27 +173,34 @@
         <div v-show="view==='videos'" class="video-library">
           <div class="video-library-heading">
             <div>
+              <div class="video-library-eyebrow">VIDEO LIBRARY</div>
               <div class="video-library-title">班级资源</div>
-              <div class="video-library-caption">先按班级查看课堂和视频数量，展开班级后可查看课堂与片段</div>
+              <div class="video-library-caption">按班级汇总课程资源。点击左侧展开箭头，逐层查看课堂和视频片段。</div>
             </div>
-            <div class="video-library-total"><strong>{{ videoQuery.total }}</strong><span>个班级</span></div>
+            <div class="video-library-total"><span>筛选结果</span><strong>{{ videoQuery.total }}</strong><span>个班级</span></div>
           </div>
-          <el-alert class="mb12" type="info" :closable="false" title="视频库会自动收录本系统下载的视频。扫描仅用于补录服务器上已有的旧视频，扫描范围是「系统设置 → 默认下载根目录」；迁移旧视频时请把原目录完整复制到该位置并保留班级/课堂文件夹结构。"></el-alert>
-          <div v-if="settingsSaved.save_dir" class="video-scan-path">旧视频扫描目录：<code>{{ settingsSaved.save_dir }}</code></div>
+          <div class="video-library-note"><span class="video-note-icon">i</span><div><strong>自动收录下载结果</strong><span>扫描用于补录服务器上已有的旧视频，范围为系统设置中的默认下载目录；请保留班级/课堂目录结构。</span><code v-if="settingsSaved.save_dir">{{ settingsSaved.save_dir }}</code></div></div>
           <el-card shadow="never" class="mb12">
-            <div class="toolbar">
-              <el-input v-model="videoQuery.keyword" placeholder="搜索班级或课堂名称 / ID" clearable style="width:280px" @keyup.enter="loadVideos(1)" @clear="loadVideos(1)"></el-input>
-              <el-select v-model="videoQuery.status" placeholder="片段状态（展开后筛选）" clearable style="width:190px" @change="onVideoStatusChange">
+            <div class="video-toolbar">
+              <div class="video-filter-group">
+              <el-input v-model="videoQuery.keyword" placeholder="搜索班级、课堂或 ID" clearable class="video-search" @keyup.enter="loadVideos(1)" @clear="loadVideos(1)"><template #prefix>⌕</template></el-input>
+              <el-select v-model="videoQuery.class_key" placeholder="全部班级" clearable filterable class="video-class-filter" @change="loadVideos(1)">
+                <el-option v-for="c in videoClassOptions" :key="c.class_key" :label="c.class_name + (c.class_id ? '（'+c.class_id+'）' : '')" :value="c.class_key"></el-option>
+              </el-select>
+              <el-date-picker v-model="videoQuery.dateRange" type="daterange" value-format="YYYY-MM-DD"
+                range-separator="~" start-placeholder="开课起" end-placeholder="开课止" class="video-date-filter" @change="loadVideos(1)"></el-date-picker>
+              <el-select v-model="videoQuery.status" placeholder="片段状态" clearable class="video-status-filter" @change="onVideoStatusChange">
                 <el-option v-for="(zh,key) in VIDEO_STATUS" :key="key" :label="zh" :value="key"></el-option>
               </el-select>
               <el-button type="primary" @click="loadVideos(1)">查询</el-button>
-              <div class="spacer"></div>
-              <el-button type="success" plain :loading="scanningVideos" @click="scanVideos">扫描默认下载目录</el-button>
-              <span class="sub-text">下载完成或已跳过的视频可在线播放</span>
+              <el-button plain @click="resetVideoFilters">重置</el-button>
+              </div>
+              <div class="video-toolbar-action"><el-button type="success" plain :loading="scanningVideos" @click="scanVideos">扫描旧视频</el-button><span>完成或已存在的视频可在线预览</span></div>
             </div>
           </el-card>
           <el-card shadow="never">
-            <el-table :data="videoClasses" v-loading="videoLoading" row-key="class_key" size="large" @expand-change="onClassExpand">
+            <div class="video-table-heading"><div><strong>班级列表</strong><span>完成数按“已完成 / 视频总数”展示</span></div><span class="video-expand-hint">⌄ 点击班级行左侧箭头展开课堂</span></div>
+            <el-table :data="videoClasses" v-loading="videoLoading" row-key="class_key" size="large" stripe class="video-class-table" @expand-change="onClassExpand">
               <el-table-column type="expand" width="48">
                 <template #default="{row:classRow}">
                   <div class="video-class-expand">
@@ -199,15 +237,15 @@
                   </div>
                 </template>
               </el-table-column>
-              <el-table-column label="班级" min-width="280">
-                <template #default="{row}"><div class="video-class-name">{{ row.class_name }}</div><div class="video-lesson-name">班级 ID：{{ row.class_id || '未提供' }}</div></template>
+              <el-table-column label="班级" min-width="300">
+                <template #default="{row}"><div class="video-class-cell"><span class="video-class-mark">班</span><div class="video-class-copy"><div class="video-class-name">{{ row.class_name }}</div><div class="video-lesson-name">班级 ID：{{ row.class_id || '未提供' }}</div></div></div></template>
               </el-table-column>
-              <el-table-column prop="lesson_count" label="课堂数" width="110"></el-table-column>
-              <el-table-column prop="video_count" label="视频数" width="110"></el-table-column>
-              <el-table-column label="已完成" width="120"><template #default="{row}">{{ row.ready_count }}/{{ row.video_count }}</template></el-table-column>
-              <el-table-column label="失败" width="90"><template #default="{row}"><span :class="{'fail-num': row.failed_count}">{{ row.failed_count }}</span></template></el-table-column>
-              <el-table-column label="占用空间" width="130"><template #default="{row}">{{ formatBytes(row.size_bytes) }}</template></el-table-column>
-              <el-table-column label="操作" width="100"><template #default><span class="video-muted">展开查看课堂</span></template></el-table-column>
+              <el-table-column prop="lesson_count" label="课堂" width="105"><template #default="{row}"><strong class="video-count">{{ row.lesson_count }}</strong><span class="video-unit">堂</span></template></el-table-column>
+              <el-table-column prop="video_count" label="视频片段" width="120"><template #default="{row}"><strong class="video-count">{{ row.video_count }}</strong><span class="video-unit">段</span></template></el-table-column>
+              <el-table-column label="完成进度" min-width="180"><template #default="{row}"><div class="video-progress-cell"><span>{{ row.ready_count }} / {{ row.video_count }}</span><el-progress :percentage="row.video_count ? Math.round(row.ready_count * 100 / row.video_count) : 0" :show-text="false" :stroke-width="6" status="success" /></div></template></el-table-column>
+              <el-table-column label="失败" width="95"><template #default="{row}"><span :class="['video-failure-count', {'is-failed': row.failed_count}]">{{ row.failed_count }}</span><span class="video-unit">段</span></template></el-table-column>
+              <el-table-column label="占用空间" width="140"><template #default="{row}"><span class="video-size">{{ formatBytes(row.size_bytes) }}</span></template></el-table-column>
+              <el-table-column label="查看" width="100"><template #default><span class="video-open-label">展开 <b>›</b></span></template></el-table-column>
               <el-table-column v-if="false" label="状态" width="105">
                 <template #default="{row}"><el-tag :type="videoStatusTag(row.status)">{{ videoStatusZh(row.status) }}</el-tag></template>
               </el-table-column>
@@ -284,42 +322,14 @@
           </el-card>
         </div>
 
-        <!-- ===== 同步管理（按钮式：同步一次 → 勾选新课 → 建任务下载） ===== -->
-        <div v-show="view==='sync'" class="settings-grid">
-          <el-card shadow="never">
-            <template #header><div class="card-head">同步配置</div></template>
-            <el-form label-width="140px" size="large">
-              <el-form-item label="控制台 Cookie">
-                <el-input v-model="syncForm.cookie" type="textarea" :rows="5"
-                  placeholder="粘贴 ClassIn 控制台（console.eeo.cn）的 Cookie；留空则使用【系统设置】中的下载 Cookie"></el-input>
-                <div class="cookie-state" v-if="syncSaved.has_cookie">
-                  当前同步 Cookie：<code>{{ syncSaved.cookie_masked }}</code>
-                </div>
-                <div class="cookie-state" v-else-if="syncSaved.using_download_cookie">
-                  未配置同步专用 Cookie，自动回退使用【系统设置】里的下载 Cookie
-                </div>
-                <div class="cookie-state" v-else>
-                  尚未配置任何可用的 Cookie，同步无法运行
-                </div>
-                <span class="hint">与下载 Cookie 同属 .eeo.cn 登录态，通常一份即可；换机构账号时可分开填</span>
-              </el-form-item>
-              <el-form-item label="回看天数">
-                <el-input-number v-model="syncForm.days" :min="1" :max="365"></el-input-number>
-                <span class="hint">每次同步拉取"最近 N 天内开课"的课堂</span>
-              </el-form-item>
-              <el-form-item>
-                <el-button type="primary" @click="saveSyncConfig">保存配置</el-button>
-                <el-button :loading="syncVerifying" @click="verifySyncCookie">验证 Cookie</el-button>
-                <span :class="syncCheckClass" v-if="syncCheckMsg">{{ syncCheckMsg }}</span>
-              </el-form-item>
-            </el-form>
-          </el-card>
-
-          <el-card shadow="never">
+        <!-- ===== 班级同步（Cookie 统一在系统设置；镜像控制台两页 + 按班级下载） ===== -->
+        <div v-show="view==='sync'">
+          <el-card shadow="never" class="mb12">
             <template #header><div class="card-head">同步操作</div></template>
-            <el-descriptions :column="1" border size="large">
-              <el-descriptions-item label="Cookie 来源">
-                {{ {sync:'同步专用 Cookie', download:'回退使用下载 Cookie', none:'未配置'}[syncStatus.cookie_source] }}
+            <el-descriptions :column="3" border size="large">
+              <el-descriptions-item label="登录 Cookie">
+                <span v-if="settingsSaved.has_cookie">已配置 <code>{{ settingsSaved.cookie_masked }}</code></span>
+                <span v-else class="hint bad" style="margin:0">未配置</span>
               </el-descriptions-item>
               <el-descriptions-item label="上次同步">{{ fmtTime(syncStatus.last_sync_at) || '从未同步' }}</el-descriptions-item>
               <el-descriptions-item label="上次结果">
@@ -330,33 +340,61 @@
               </el-descriptions-item>
             </el-descriptions>
             <div class="mt12">
-              <el-button type="primary" :loading="syncing" @click="runSyncNow">立即同步</el-button>
-              <span class="hint">从控制台拉取最新课堂列表并入库；不会自动下载——在下方勾选后手动建任务</span>
+              <el-button type="primary" :loading="consoleSyncing" @click="runConsoleSync">立即同步</el-button>
+              <el-button :loading="syncVerifying" @click="verifySyncCookie">验证 Cookie</el-button>
+              <span :class="syncCheckClass" v-if="syncCheckMsg">{{ syncCheckMsg }}</span>
+              <span class="hint">Cookie 与登录 / 下载共用同一份，统一在【系统设置】维护；同步拉取控制台「班级管理」+「课堂管理」两页（幂等，不自动下载）</span>
             </div>
           </el-card>
         </div>
 
-        <!-- 待下载新课：同步新增且未纳入过任务的课堂，勾选后建常规下载任务 -->
+        <!-- 班级/课程列表：镜像控制台「班级管理」页（/course/web/list），支持整班/按课堂下载 -->
         <div v-show="view==='sync'" class="mt12">
           <el-card shadow="never">
-            <template #header><div class="card-head">待下载新课（{{ syncPending.length }}）</div></template>
-            <el-table :data="syncPending" ref="syncPendingTable" border @selection-change="onSyncPendingSelect" empty-text="暂无待下载新课：点击上方「立即同步」拉取最新课堂">
-              <el-table-column type="selection" width="46"></el-table-column>
-              <el-table-column prop="class_name" label="班级" min-width="180" show-overflow-tooltip></el-table-column>
-              <el-table-column prop="lesson_name" label="课堂" min-width="220" show-overflow-tooltip></el-table-column>
-              <el-table-column prop="lesson_id" label="课堂ID" width="130"></el-table-column>
-              <el-table-column prop="start_time" label="开课时间" width="150"></el-table-column>
-              <el-table-column label="状态" width="96">
-                <template #default="{ row }">
-                  <el-tag :type="row.started ? 'success' : 'info'" size="small">{{ row.started ? '已开课' : '未开课' }}</el-tag>
+            <template #header><div class="card-head">班级/课程列表（{{ courseQuery.total }}）</div></template>
+            <div class="toolbar mb12">
+              <el-input v-model="courseQuery.keyword" placeholder="搜索班级名/ID/教师" clearable style="width:240px" @keyup.enter="loadCourses(1)" @clear="loadCourses(1)"></el-input>
+              <el-button type="primary" @click="loadCourses(1)">查询</el-button>
+              <span class="hint">对应控制台「班级管理」页；可整班一键下载，或展开班级勾选课堂后下载</span>
+            </div>
+            <el-table :data="courses" v-loading="courseLoading" border row-key="course_id" @expand-change="onCourseExpand" empty-text="暂无数据：请先点击上方「立即同步」">
+              <el-table-column type="expand" width="46">
+                <template #default="{row}">
+                  <div class="course-expand" v-loading="courseLessonLoading[row.course_id]">
+                    <div class="segment-head">
+                      <span class="segment-title">本班课堂</span>
+                      <span v-if="courseLessons[row.course_id]">共 <b>{{ courseLessons[row.course_id].length }}</b> 节</span>
+                      <el-button size="small" text type="primary" @click="loadCourseLessons(row, true)">刷新</el-button>
+                    </div>
+                    <el-table :data="courseLessons[row.course_id] || []" size="small" @selection-change="rows => (courseSelected[row.course_id] = rows)" empty-text="该班级还没有同步到课堂（可能尚未录课）">
+                      <el-table-column type="selection" width="42"></el-table-column>
+                      <el-table-column prop="lesson_id" label="课堂ID" width="120"></el-table-column>
+                      <el-table-column prop="lesson_name" label="课堂名称" min-width="200" show-overflow-tooltip></el-table-column>
+                      <el-table-column prop="start_time" label="开课时间" width="150"></el-table-column>
+                      <el-table-column label="下载状态" width="110"><template #default="{row:l}"><el-tag size="small" :type="downloadStateTag(l.download_state)">{{ downloadStateZh(l.download_state) }}</el-tag></template></el-table-column>
+                      <el-table-column label="操作" width="90"><template #default="{row:l}"><el-button link type="success" :loading="lessonDownloadId===l.id" @click="downloadLesson(l)">下载</el-button></template></el-table-column>
+                    </el-table>
+                    <div class="mt12">
+                      <el-button type="warning" :disabled="!(courseSelected[row.course_id]||[]).length" @click="downloadCourseSelectedLessons(row)">下载所选课堂（{{ (courseSelected[row.course_id]||[]).length }}）</el-button>
+                    </div>
+                  </div>
                 </template>
               </el-table-column>
+              <el-table-column prop="course_id" label="班级ID" width="130"></el-table-column>
+              <el-table-column prop="course_name" label="班级/课程名" min-width="220" show-overflow-tooltip></el-table-column>
+              <el-table-column prop="teacher_name" label="主讲教师" width="110" show-overflow-tooltip></el-table-column>
+              <el-table-column label="创建人" width="110" show-overflow-tooltip>
+                <template #default="{row}">{{ row.creator_name || '—' }}</template>
+              </el-table-column>
+              <el-table-column label="课堂数" width="100"><template #default="{row}">{{ row.complete_class_num }}/{{ row.class_total }}</template></el-table-column>
+              <el-table-column prop="student_num" label="学生数" width="90"></el-table-column>
+              <el-table-column prop="first_class_begin_time" label="开课时间" width="150"><template #default="{row}">{{ row.first_class_begin_time || '—' }}</template></el-table-column>
+              <el-table-column label="状态" width="90"><template #default="{row}"><el-tag size="small" :type="row.course_state===1?'success':'info'">{{ row.course_state===1 ? '进行中' : ('状态'+row.course_state) }}</el-tag></template></el-table-column>
+              <el-table-column label="操作" width="130" fixed="right"><template #default="{row}"><el-button link type="success" :loading="courseDownloadingId===row.course_id" @click="downloadCourse(row)">下载本班课堂</el-button></template></el-table-column>
             </el-table>
-            <div class="mt12">
-              <el-button type="primary" :disabled="!syncSelected.length" :loading="syncDownloading" @click="downloadSelectedLessons">
-                下载所选（{{ syncSelected.length }}）
-              </el-button>
-              <span class="hint">选择课堂即下载该课堂下的全部视频片段；建任务后可在下载任务页查看实时进度与任务日志，已开课课堂默认勾选</span>
+            <div class="pager">
+              <el-pagination background layout="total, prev, pager, next" :total="courseQuery.total"
+                :page-size="courseQuery.page_size" :current-page="courseQuery.page" @current-change="loadCourses"></el-pagination>
             </div>
           </el-card>
         </div>
@@ -415,6 +453,23 @@
               <el-button :loading="verifying" @click="verifyCookie">验证有效性</el-button>
               <span :class="cookieCheckClass" v-if="cookieCheckMsg">{{ cookieCheckMsg }}</span>
             </div>
+          </el-card>
+
+          <el-card shadow="never">
+            <template #header><div class="card-head">ClassIn 账号（备用）</div></template>
+            <el-alert type="info" :closable="false" class="mb12" title="当前不做自动登录（控制台登录含图形/滑块验证码）。此处保存账号密码以便凭据失效时人工重新登录，系统会在同步失败时提醒你更新 Cookie。"></el-alert>
+            <el-form label-width="110px" size="large">
+              <el-form-item label="账号">
+                <el-input v-model="settingsForm.classin_account" placeholder="手机号 / 邮箱（可选）"></el-input>
+              </el-form-item>
+              <el-form-item label="密码">
+                <el-input v-model="settingsForm.classin_password" type="password" show-password placeholder="留空则不修改"></el-input>
+                <div class="cookie-state" v-if="settingsSaved.has_classin_password">已保存密码：<code>{{ settingsSaved.classin_password_masked }}</code></div>
+              </el-form-item>
+              <el-form-item>
+                <el-button type="primary" @click="saveSettings">保存账号</el-button>
+              </el-form-item>
+            </el-form>
           </el-card>
         </div>
       </div>
@@ -520,9 +575,18 @@
       </div>
       <el-alert v-if="detail.task.error" type="error" :title="detail.task.error" :closable="false" class="mb12"></el-alert>
 
+      <!-- 失败课堂汇总：打开任务详情即置顶展示，不用再翻日志找原因 -->
+      <div v-if="failedItems.length" class="fail-panel mb12">
+        <div class="fail-panel-title">❌ 失败课堂 {{ failedItems.length }} 个（错误原因如下）</div>
+        <div v-for="it in failedItems" :key="it.id" class="fail-line">
+          <b>{{ it.class_name || it.class_id || '未命名班级' }}</b> · {{ it.lesson_name || it.lesson_id }}：<span>{{ it.message || '引擎未返回具体原因，详见「运行日志」' }}</span>
+        </div>
+      </div>
+
       <el-tabs v-model="detail.tab">
         <el-tab-pane label="课堂明细" name="items">
-          <el-table :data="detail.task.items" size="small" max-height="320">
+          <div class="mb12"><el-checkbox v-model="detail.onlyFailed">只看失败课堂（{{ failedItems.length }}）</el-checkbox></div>
+          <el-table :data="detail.onlyFailed ? failedItems : detail.task.items" size="small" max-height="320">
             <el-table-column prop="class_name" label="班级" min-width="140" show-overflow-tooltip></el-table-column>
             <el-table-column prop="lesson_name" label="课堂" min-width="180" show-overflow-tooltip></el-table-column>
             <el-table-column label="状态" width="90">
@@ -568,6 +632,6 @@
 <script src="/static/vendor/vue.global.prod.js"></script>
 <script src="/static/vendor/element-plus.min.js"></script>
 <script src="/static/vendor/element-icons.js"></script>
-<script src="/static/app.js?v=20261015-sync2"></script>
+<script src="/static/app.js?v=20261016-filters"></script>
 </body>
 </html>

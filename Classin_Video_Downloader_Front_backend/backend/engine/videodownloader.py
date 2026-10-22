@@ -178,98 +178,75 @@ def get_course_details(driver):
 
 
 def get_download_info(driver, course_id, lesson_id):
+    # ClassIn 新版页面使用独立的 /v/WebcastPlayback 路由，旧版
+    # #/singlePage 路由已失效。直接打开页面地址也便于 SPA 在登录态下初始化。
     page_url = (
-        f"https://console.eeo.cn/saas/school/index.html#/singlePage/"
-        f"CourseManagement/recordLessonManagement?courseId={course_id}"
-        f"&lessonId={lesson_id}&record=true&live=true"
+        "https://console.eeo.cn/saas/school/v/WebcastPlayback/recordLessonManagement"
+        f"?courseId={course_id}&lessonId={lesson_id}&record=true&live=false"
     )
-    
-    # 使用JavaScript直接导航，确保SPA路由正确更新
-    driver.get("https://console.eeo.cn/saas/school/index.html")
-    time.sleep(2)
-    
-    # 通过JS设置hash来触发SPA路由变化
-    js_navigate = f"""
-    window.location.hash = '/singlePage/CourseManagement/recordLessonManagement?courseId={course_id}&lessonId={lesson_id}&record=true&live=true';
-    """
-    driver.execute_script(js_navigate)
-    time.sleep(3)
-    
-    # 等待表格出现（增加超时时间）
+    driver.get(page_url)
+
     try:
-        WebDriverWait(driver, 25).until(
-            EC.presence_of_all_elements_located((By.XPATH, '/html/body/div[1]/div/div[2]/div/div[4]/div/div[3]/table/tbody/tr'))
+        # 新页面在数据加载完成后渲染 videodata_numCount 和带 download 属性的直链。
+        def video_list_ready(d):
+            counters = d.find_elements(By.CSS_SELECTOR, ".videodata_numCount")
+            links = d.find_elements(By.CSS_SELECTOR, "tr.el-table__row a[download][href]")
+            if not counters:
+                return bool(links)
+            match = re.search(r"\((\d+)\)", counters[0].text or "")
+            return len(links) >= int(match.group(1)) if match else bool(links)
+
+        WebDriverWait(driver, 30).until(
+            video_list_ready
         )
-        # 额外等待确保数据完全加载
-        time.sleep(2)
     except Exception as e:
-        print('等待视频列表加载失败:', e)
+        print(f'等待新版录课视频列表加载失败 (课程ID:{course_id}, 课堂ID:{lesson_id}):', e)
         return None, []
 
-    # 获取课程名称
-    course_name = get_course_details(driver)
-    if not course_name:
-        return None, []
-
-    video_rows = driver.find_elements(By.XPATH, '/html/body/div[1]/div/div[2]/div/div[4]/div/div[3]/table/tbody/tr')
-    print(f'[DEBUG] 找到 {len(video_rows)} 行视频数据 (课程ID:{course_id}, 课堂ID:{lesson_id}, 课程名:{course_name})')
+    video_rows = driver.find_elements(By.CSS_SELECTOR, "tr.el-table__row")
     videos = []
+    course_name = None
     for row_idx, row in enumerate(video_rows):
         try:
-            # 获取所有td元素，以便调试
-            tds = row.find_elements(By.TAG_NAME, 'td')
-            print(f'[DEBUG] 第{row_idx}行有 {len(tds)} 个td')
-            
-            # 尝试从不同的td获取数据
-            # 通常表格列顺序：序号, 视频标题, 课堂, 录制方式, 开始时间, 结束时间, 时长, 文件大小, 下载
-            download_url = None
-            record_time_text = None
-            record_method = None
-            segment_title = None
-            
-            # 遍历所有td找到下载链接
-            for td_idx, td in enumerate(tds):
-                try:
-                    a_elem = td.find_elements(By.TAG_NAME, 'a')
-                    if a_elem:
-                        href = a_elem[0].get_attribute('href')
-                        if href and 'http' in href:
-                            download_url = href
-                            print(f'[DEBUG] 第{row_idx}行在td[{td_idx}]找到下载URL')
-                except Exception:
-                    pass
-            
-            # 按常见位置尝试获取其他字段
-            if len(tds) > 4:
-                try:
-                    segment_title = sanitize_filename(tds[1].text.strip())
-                except Exception:
-                    segment_title = None
-            
-            if len(tds) > 3:
-                try:
-                    record_method = sanitize_filename(tds[3].text.strip())
-                except Exception:
-                    record_method = None
-            
-            if len(tds) > 4:
-                try:
-                    record_time_text = tds[4].text.strip()
-                except Exception:
-                    record_time_text = None
-            
-            if not download_url:
-                print(f'[DEBUG] 第{row_idx}行未找到下载URL，跳过此行')
+            links = row.find_elements(By.CSS_SELECTOR, "a[download][href]")
+            if not links:
                 continue
-                
-            record_date = record_time_text.split(' ')[0] if record_time_text else '未知日期'
-            record_method = record_method or '未知方式'
-            segment_title = segment_title or f'片段_{row_idx+1}'
-            
+            link = links[0]
+            download_url = (link.get_attribute("href") or "").strip()
+            if not download_url.startswith(("http://", "https://")):
+                continue
+
+            cells = row.find_elements(By.CSS_SELECTOR, "td")
+            segment_title = sanitize_filename(cells[1].text.strip()) if len(cells) > 1 else None
+            # 新版列顺序：片段、录制类型、录制位置、时间范围、时长、大小、状态、下载。
+            record_type = cells[2].text.strip() if len(cells) > 2 else ""
+            record_location = cells[3].text.strip() if len(cells) > 3 else ""
+            record_method = sanitize_filename("_".join(x for x in (record_type, record_location) if x)) or "未知方式"
+            record_time_text = cells[4].text.strip() if len(cells) > 4 else ""
+            record_date = record_time_text.split()[0] if record_time_text else "未知日期"
+            segment_title = segment_title or f'片段_{row_idx + 1}'
+
+            # 新版页面把课程名放在下载链接 title 中（末尾带片段序号）。
+            if not course_name:
+                link_title = (link.get_attribute("title") or "").strip()
+                course_name = re.sub(r"\s+_\s+\d+$", "", link_title).strip() or None
+
             print(f'[DEBUG] 第{row_idx}行: 标题={segment_title}, 日期={record_date}, 方式={record_method}, URL={download_url[:50]}...')
-            videos.append({'download_url': download_url, 'record_date': record_date, 'record_method': record_method, 'segment_title': segment_title})
+            videos.append({
+                'download_url': download_url,
+                'record_date': record_date,
+                'record_method': record_method,
+                'segment_title': segment_title,
+            })
         except Exception as e:
             print(f'[DEBUG] 解析第{row_idx}行视频条目失败: {e}')
+
+    if not course_name and videos:
+        # 页面标题作为兜底；去掉站点名后再用于目录和文件名。
+        page_title = (driver.title or "").strip()
+        course_name = re.sub(r"^录课视频数据\(|\)\s*-\s*.*$", "", page_title).strip() or page_title
+    course_name = sanitize_filename(course_name) if course_name else None
+    print(f'[DEBUG] 找到 {len(videos)} 个视频 (课程ID:{course_id}, 课堂ID:{lesson_id}, 课程名:{course_name or "未知"})')
     return course_name, videos
 
 
@@ -529,6 +506,7 @@ def download_videos(save_dir, csv_file, cookie_str, driver_path=None, headless=F
                         video_status_callback({
                             'course': course, 'video': video, 'path': save_path,
                             'status': status, 'percent': percent, 'error': error,
+                            'video_index': idx, 'total_videos': total_videos,
                         })
                     except Exception:
                         pass

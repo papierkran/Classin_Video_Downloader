@@ -37,8 +37,9 @@ from ..schemas import TaskCreateIn, TaskDetailOut, TaskItemOut, TaskLogsPageOut
 logger = logging.getLogger("app.task")
 
 # 可启动（或重新启动）的状态集合；running/paused/stopping 一律拒绝
-RESTARTABLE = ("created", "failed", "cancelled", "success")
+RESTARTABLE = ("created", "failed", "cancelled", "success", "queued")
 ACTIVE = ("running", "paused", "stopping")  # 占用全局闸门的状态
+# queued 不占用闸门：它只是"已提交、等待前一个任务结束"，由 _finalize 依次放行
 # Why 把状态集提成常量而非散落字符串：start/delete/pause 三处都要判断，
 # 集中一处改（如新增 queued 状态）不会漏改——漏改的表现是"新状态能被
 # 并发启动"，属并发 bug，极难复现。
@@ -70,6 +71,40 @@ class TaskRuntime:
         self.current_lesson = ""
         self.item_percent = 0  # 当前课堂内部进度
         self.video_last_flush: dict[str, float] = {}
+        # 各并行课堂的进度分数（0..1）与近期下载速率。引擎在同一
+        # 课堂内串行下载视频，因此课堂 ID 可作为下载流的稳定键。
+        self.lesson_progress: dict[str, float] = {}
+        self.lesson_video_progress: dict[str, dict[int, float]] = {}
+        self.lesson_video_totals: dict[str, int] = {}
+        self.active_download_speeds: dict[tuple[str, int], tuple[float, float]] = {}
+        self.completed_lessons: set[str] = set()
+
+    def refresh_progress(self) -> None:
+        done = min(self.total_items, self.items_done + sum(self.lesson_progress.values()))
+        self.percent = min(99, int(done * 100 / max(self.total_items, 1)))
+
+    def refresh_speed(self, now: float | None = None) -> None:
+        # 进度回调约每 0.5 秒一次；超过 2 秒未更新的流视为暂停/阻塞，
+        # 避免网络停住时页面仍显示旧速度。
+        now = now if now is not None else time.monotonic()
+        self.speed_mbps = sum(
+            speed for speed, updated_at in self.active_download_speeds.values()
+            if now - updated_at <= 2.0
+        )
+
+    def refresh_lesson_progress(self, lesson_id: str) -> float:
+        total = self.lesson_video_totals.get(lesson_id, 0)
+        videos = self.lesson_video_progress.get(lesson_id, {})
+        fraction = min(1.0, sum(videos.values()) / total) if total else 0.0
+        self.lesson_progress[lesson_id] = fraction
+        return fraction
+
+    def clear_lesson_progress(self, lesson_id: str) -> None:
+        self.lesson_progress.pop(lesson_id, None)
+        self.lesson_video_progress.pop(lesson_id, None)
+        self.lesson_video_totals.pop(lesson_id, None)
+        for key in [key for key in self.active_download_speeds if key[0] == lesson_id]:
+            self.active_download_speeds.pop(key, None)
 
 
 class TaskService:
@@ -95,7 +130,10 @@ class TaskService:
         """分页列表。count 与取页共用同一 stmt，保证 total 与 items 口径一致
         （先后两次不同条件查询会出现"共 N 条但翻不到第 N 条"的错位）。"""
         stmt = self.repo.filtered(status=status)
-        return self.repo.count(stmt), self.repo.page(stmt, page, page_size)
+        total = self.repo.count(stmt)
+        rows = self.repo.page(stmt, page, page_size)
+        self._refresh_live_snapshot(rows)
+        return total, rows
 
     def get(self, task_id: int) -> DownloadTask:
         """取任务，不存在抛 404（把 NotFoundError 收敛在 service，
@@ -109,9 +147,25 @@ class TaskService:
         """详情 = 任务本体 + 明细 items。两查合一而非 JOIN：items 行数
         少（≤5000）且需要独立序列化，JOIN 反而要做行去重。"""
         task = self.get(task_id)
+        self._refresh_live_snapshot([task])
         detail = TaskDetailOut.model_validate(task)
         detail.items = [TaskItemOut.model_validate(i) for i in self.item_repo.list_by_task(task_id)]
         return detail
+
+    @staticmethod
+    def _refresh_live_snapshot(tasks: list[DownloadTask]) -> None:
+        """读取任务时刷新内存态的并发进度和近期速度（不额外写库）。"""
+        runtime = _runtime
+        if runtime is None or runtime.finished:
+            return
+        with runtime.lock:
+            now = time.monotonic()
+            runtime.refresh_speed(now)
+            for task in tasks:
+                if task.id != runtime.task_id:
+                    continue
+                task.percent = runtime.percent
+                task.speed_mbps = runtime.speed_mbps if task.status == "running" else 0.0
 
     def get_logs(self, task_id: int, after_id: int, limit: int) -> TaskLogsPageOut:
         """增量日志页。last_id 回传给前端做下次轮询的游标——
@@ -205,16 +259,22 @@ class TaskService:
                 raise ConflictError(f"任务当前状态为'{_zh(task.status)}'，无法再次启动")
             if task.status not in RESTARTABLE:
                 raise ConflictError(f"状态'{_zh(task.status)}'的任务不能启动")
-            # 全局闸门：DB 状态可能因崩溃残留为 running，所以两处都要查
-            # （DB 查活跃任务 + 内存 _runtime），任一命中都拒绝
-            if _runtime is not None and not _runtime.finished:
-                running = self.repo.get(_runtime.task_id)
-                name = running.name if running else str(_runtime.task_id)
-                raise ConflictError(f"已有任务正在运行（#{_runtime.task_id} {name}），请先停止")
 
             items = self.item_repo.list_by_task(task_id)
             if not items:
                 raise ValidationFailure("任务中没有课堂，无法启动")
+
+            # 全局闸门：已有任务运行时不再报 409，而是进入队列（FIFO），
+            # 由 _finalize 在本轮结束后自动启动最早排队的任务。
+            if _runtime is not None and not _runtime.finished:
+                if task.status != "queued":
+                    task.status = "queued"
+                    task.error = ""
+                    task.finished_at = None
+                    self.append_log(task_id, "已有任务运行中，已加入队列等待")
+                    self.db.commit()
+                    logger.info("任务 #%d 已加入队列", task_id)
+                return task
 
             # 业务前置校验：Cookie 是引擎注入登录态的唯一凭据，空则必失败。
             # Why 在启动前拦而不是让引擎跑起来再报错：引擎启动浏览器要
@@ -293,6 +353,13 @@ class TaskService:
             task = self.get(task_id)
             if task.status == "stopping":
                 raise ConflictError("任务正在停止中，请稍候")
+            # 排队中尚未占用 runtime：直接取消，避免用户只能等它跑起来再停
+            if task.status == "queued":
+                task.status = "cancelled"
+                task.finished_at = datetime.utcnow()
+                self.append_log(task_id, "已取消排队")
+                self.db.commit()
+                return task
             self._require_runtime(task_id, "停止")
             # 先清暂停：否则引擎卡在 pause 自旋里看不到 stop 信号
             _runtime.pause_event.clear()
@@ -326,6 +393,53 @@ def _zh(status: str) -> str:
 # ---------- worker 线程 ----------
 
 
+def fetch_videos_via_console(cookie: str, class_names: dict[str, str], course_id, lesson_id) -> tuple[str, list[dict]]:
+    """用控制台接口代替引擎的 DOM 抓取，返回 (班级名, 片段列表)。
+
+    Why：录课页的 DOM 就绪判定不稳定——页面计数初始为 `(0)` 时会被
+    `video_list_ready` 当成"已加载完成"，随后取行数为 0，任务日志表现为
+    "获取到 0 个视频"；网络慢时又会 30s 超时。getClassVodList 与镜像同步
+    同一数据源，直接返回 FileList + Playset 直链，无需等页面渲染。
+
+    命名保持与引擎历史一致：FileList 顺序即"片段 1..N"，CIDExt 非空
+    （camera.*）为录制现场，空为教室。
+    """
+    from .course_service import fetch_class_vod
+
+    _total, files = fetch_class_vod(cookie, str(course_id), str(lesson_id))
+    videos: list[dict] = []
+    for idx, item in enumerate(files, start=1):
+        video = _file_to_video(item, idx)
+        if video:
+            videos.append(video)
+    return class_names.get(str(lesson_id)) or "未知班级", videos
+
+
+def _file_to_video(item: dict, idx: int) -> dict | None:
+    """把 getClassVodList 的 FileList 项转成引擎认识的 video dict。
+
+    命名保持与引擎历史一致：FileList 顺序即"片段 1..N"，CIDExt 非空
+    （camera.*）为录制现场，空为教室。无直链/空文件（转码中、已删除）返回 None。
+    """
+    url = next(
+        (p.get("Url") for p in (item.get("Playset") or []) if isinstance(p, dict) and p.get("Url")),
+        "",
+    )
+    try:
+        size = int(item.get("Size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if not url or size <= 0:
+        return None
+    start = str(item.get("StartTime") or "")
+    return {
+        "download_url": url,
+        "record_date": start.split()[0] if start else "未知日期",
+        "record_method": "录制现场" if str(item.get("CIDExt") or "").strip() else "教室",
+        "segment_title": f"片段 {idx}",
+    }
+
+
 def _worker(task_id: int, runtime: TaskRuntime) -> None:
     """后台下载线程：持有独立 DB session（请求线程的 session 不能跨线程用）。
 
@@ -336,6 +450,7 @@ def _worker(task_id: int, runtime: TaskRuntime) -> None:
     global _runtime
     db = SessionLocal()
     error_msg = ""
+    original_get_info = None
     try:
         task = db.get(DownloadTask, task_id)
         row = db.get(AppSetting, 1)
@@ -352,6 +467,24 @@ def _worker(task_id: int, runtime: TaskRuntime) -> None:
             }
             for i in items
         ]
+
+        # 用接口取片段替换引擎的页面 DOM 抓取（原因见 fetch_videos_via_console）；
+        # 下载仍走引擎的线程池/进度/续传逻辑，引擎文件本身不改。
+        original_get_info = videodownloader.get_download_info
+        class_names = {
+            str(c["lesson_id"]): (c.get("class_name") or c.get("lesson_name") or "未知班级")
+            for c in courses
+        }
+        cookie_value = row.cookie if row else ""
+
+        def _fetch_via_console(_driver, course_id, lesson_id):
+            try:
+                return fetch_videos_via_console(cookie_value, class_names, course_id, lesson_id)
+            except Exception as e:
+                _on_log(db, runtime, f"接口获取课堂 {lesson_id} 片段失败: {e}")
+                return "未知班级", []
+
+        videodownloader.get_download_info = _fetch_via_console
 
         videodownloader.download_videos(
             save_dir=task.save_dir,
@@ -381,6 +514,10 @@ def _worker(task_id: int, runtime: TaskRuntime) -> None:
         logger.exception("任务 #%d worker 异常", task_id)
         error_msg = str(e)[:1000] or e.__class__.__name__
     finally:
+        # 恢复引擎原始取片段函数：模块级 monkeypatch 必须在任务结束时撤销，
+        # 否则后续（或手工调用的）下载会一直走接口模式。
+        if original_get_info is not None:
+            videodownloader.get_download_info = original_get_info
         # 顺序有意：先写终态（_finalize）再清 _runtime——反了的话，
         # 并发 start 会看到"runtime 没了但 DB 还是 running"的中间态
         _finalize(db, runtime, error_msg)
@@ -389,6 +526,48 @@ def _worker(task_id: int, runtime: TaskRuntime) -> None:
             runtime.finished = True
             if _runtime is runtime:
                 _runtime = None
+        # 闸门释放后再放行下一个排队任务（放在锁外，避免 start() 重入死锁）
+        _promote_next_queued()
+
+
+def _promote_next_queued() -> None:
+    """放行最早排队的任务（FIFO）。调用时机：上一任务收尾、服务启动恢复。"""
+    try:
+        with SessionLocal() as db:
+            next_id = db.scalar(
+                select(DownloadTask.id).where(DownloadTask.status == "queued").order_by(DownloadTask.id).limit(1)
+            )
+    except Exception:
+        logger.exception("查询排队任务失败")
+        return
+    if next_id is None:
+        return
+    threading.Thread(target=_launch_queued, args=(next_id,), daemon=True, name=f"dl-queue-{next_id}").start()
+
+
+def _launch_queued(task_id: int) -> None:
+    """用独立 session 启动排队任务；失败则标记并继续放行下一个，避免卡死队列。"""
+    db = SessionLocal()
+    failed = False
+    try:
+        TaskService(db).start(task_id)
+    except Exception as e:
+        failed = True
+        logger.exception("启动排队任务 #%d 失败", task_id)
+        try:
+            task = db.get(DownloadTask, task_id)
+            if task and task.status == "queued":
+                task.status = "failed"
+                task.error = f"排队任务启动失败: {e}"[:1000]
+                task.finished_at = datetime.utcnow()
+                db.add(DownloadLog(task_id=task_id, level="ERROR", message=task.error))
+                db.commit()
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()
+    if failed:
+        _promote_next_queued()
 
 
 def _on_log(db: Session, runtime: TaskRuntime, msg: str) -> None:
@@ -413,8 +592,12 @@ def _on_course_status(db: Session, runtime: TaskRuntime, course: dict, status: s
             # items_done 是总进度的分子：min 封顶防止引擎对同一课重发
             # 终态事件（重试路径）把进度算超 100%
             if status in ("success", "failed"):
-                runtime.items_done = min(runtime.items_done + 1, runtime.total_items)
-                runtime.speed_mbps = 0.0
+                if lesson_id not in runtime.completed_lessons:
+                    runtime.completed_lessons.add(lesson_id)
+                    runtime.items_done = min(runtime.items_done + 1, runtime.total_items)
+                runtime.clear_lesson_progress(lesson_id)
+                runtime.refresh_progress()
+                runtime.refresh_speed()
             # 回写课堂表：课堂列表的状态列与仪表盘统计都读这里
             lesson = db.scalars(select(Lesson).where(Lesson.lesson_id == lesson_id)).first()
             if lesson:
@@ -430,6 +613,10 @@ def _on_course_status(db: Session, runtime: TaskRuntime, course: dict, status: s
                     # 挂着中间百分比反而像还在跑（前端按 status 着色）
                     item.percent = 100
             _recount(db, runtime)
+            task = db.get(DownloadTask, runtime.task_id)
+            if task:
+                task.percent = runtime.percent
+                task.speed_mbps = runtime.speed_mbps
             db.commit()
     except Exception:
         logger.exception("更新课堂状态失败")
@@ -455,9 +642,8 @@ def _on_lesson_done(db: Session, runtime: TaskRuntime, info: dict) -> None:
             if item:
                 item.video_total = total
                 item.video_done = downloaded
-                # total=0（无视频）直接记 100：状态是 failed 时进度条满格
-                # 反而误导，但 0/0 显示 0% 又像"没跑"，取 100 表示"已处理完"
-                item.percent = int(downloaded * 100 / total) if total else 100
+                # _on_course_status 已将终态课堂进度设为 100；这里仅校准
+                # 成功片段计数，不能再用成功数覆盖实时字节进度并导致回跳。
             _recount(db, runtime)
             db.commit()
     except Exception:
@@ -487,7 +673,30 @@ def _on_video_status(db: Session, runtime: TaskRuntime, event: dict) -> None:
         source_key = _video_source_key(lesson_id, video)
         status = str(event.get("status") or "pending")
         now = time.monotonic()
+        video_index = int(event.get("video_index") or 0)
+        total_videos = int(event.get("total_videos") or 0)
         with runtime.lock:
+            if video_index > 0:
+                if total_videos > 0:
+                    runtime.lesson_video_totals[lesson_id] = total_videos
+                video_progress = runtime.lesson_video_progress.setdefault(lesson_id, {})
+                if status == "downloading":
+                    video_progress.setdefault(video_index, 0.0)
+                elif status in ("success", "skipped"):
+                    video_progress[video_index] = 1.0
+                elif status == "failed":
+                    video_progress[video_index] = max(0.0, min(1.0, float(event.get("percent") or 0) / 100))
+                fraction = runtime.refresh_lesson_progress(lesson_id)
+                item_id = runtime.items_map.get(lesson_id)
+                task_item = db.get(TaskItem, item_id) if item_id else None
+                if task_item:
+                    task_item.video_total = runtime.lesson_video_totals.get(lesson_id, total_videos)
+                    task_item.video_done = sum(value >= 1.0 for value in video_progress.values())
+                    task_item.percent = int(fraction * 100)
+                if status != "downloading":
+                    runtime.active_download_speeds.pop((lesson_id, video_index), None)
+                runtime.refresh_progress()
+                runtime.refresh_speed(now)
             if status == "downloading" and now - runtime.video_last_flush.get(source_key, 0) < 1.0:
                 return
             runtime.video_last_flush[source_key] = now
@@ -522,6 +731,10 @@ def _on_video_status(db: Session, runtime: TaskRuntime, event: dict) -> None:
                 asset.size_bytes = os.path.getsize(real_path) if real_path and os.path.isfile(real_path) else 0
             except OSError:
                 asset.size_bytes = 0
+            task = db.get(DownloadTask, runtime.task_id)
+            if task and task.status == "running":
+                task.percent = runtime.percent
+                task.speed_mbps = runtime.speed_mbps
             db.commit()
     except Exception:
         logger.exception("更新视频台账失败")
@@ -656,11 +869,25 @@ def _on_progress(db: Session, runtime: TaskRuntime, total_courses: int, course_i
             # video 是 dict 才是真正的下载进度（引擎还有一种传课程下标的调用，
             # 语义是"第 N 课开始"，不含百分比，这里忽略避免算错进度）
             if isinstance(video, dict) and total_courses:
-                v_percent = int(video.get("percent") or 0)
-                runtime.speed_mbps = float(video.get("speed_mbps") or 0.0)
+                v_percent = max(0, min(100, int(video.get("percent") or 0)))
                 runtime.item_percent = v_percent
                 v_total = int(video.get("total_videos") or 1) or 1
                 v_index = int(video.get("video_index") or 1)
+                lesson_id = str((course or {}).get("lesson_id") or "")
+                if lesson_id:
+                    v_index = max(1, min(v_total, v_index))
+                    runtime.lesson_video_totals[lesson_id] = v_total
+                    video_progress = runtime.lesson_video_progress.setdefault(lesson_id, {})
+                    video_progress[v_index] = v_percent / 100
+                    fraction = runtime.refresh_lesson_progress(lesson_id)
+                    speed = max(0.0, float(video.get("speed_mbps") or 0.0))
+                    now = time.monotonic()
+                    speed_key = (lesson_id, v_index)
+                    if speed > 0:
+                        runtime.active_download_speeds[speed_key] = (speed, now)
+                    else:
+                        runtime.active_download_speeds.pop(speed_key, None)
+                    runtime.refresh_speed(now)
                 # items_map 把 lesson_id 直接映射到行 id：回调高频，
                 # 每次查库定位 item 会把 SQLite 读写比推高一个量级
                 item_id = runtime.items_map.get((course or {}).get("lesson_id", ""))
@@ -668,14 +895,13 @@ def _on_progress(db: Session, runtime: TaskRuntime, total_courses: int, course_i
                     item = db.get(TaskItem, item_id)
                     if item:
                         item.video_total = v_total
-                        item.video_done = v_index
-                        # 单课进度 = 已完成视频数 + 当前视频进度的加权
-                        item.percent = int(((v_index - 1) + v_percent / 100) * 100 / v_total)
+                        item.video_done = sum(value >= 1.0 for value in video_progress.values())
+                        # 多片段并发时，每段独立累计，再按课堂片段总数平均。
+                        item.percent = int(fraction * 100)
                 if course:
                     runtime.current_lesson = course.get("lesson_name") or course.get("class_name") or ""
-                # 总进度封顶 99：终态翻转前不允许显示 100%（否则用户以为
-                # 结束了去点停止，实际上还在收尾写库）
-                runtime.percent = min(99, int((runtime.items_done + (v_percent / 100)) * 100 / max(runtime.total_items, 1)))
+                # 汇总所有未结束课堂各自的进度，而不是只使用最后回调线程。
+                runtime.refresh_progress()
 
             now = time.monotonic()
             if now - runtime.last_flush < 0.5:  # 0.5s 节流：4 线程并发时也只 ~2 写/秒
@@ -799,3 +1025,5 @@ def recover_stale_tasks() -> None:
         if stale:
             db.commit()
             logger.warning("已恢复 %d 个中断任务", len(stale))
+    # 重启前排队中的任务继续放行（一次只启动队首，后续由 _finalize 接力）
+    _promote_next_queued()

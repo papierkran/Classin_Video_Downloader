@@ -35,7 +35,7 @@ async function api(path, options = {}) {
 }
 
 /* ---------- 状态中文映射（前后端共享词表，集中一处便于维护） ---------- */
-const TASK_STATUS = { created: '待启动', running: '运行中', paused: '已暂停', stopping: '停止中', success: '已完成', failed: '已失败', cancelled: '已取消' };
+const TASK_STATUS = { created: '待启动', queued: '排队中', running: '运行中', paused: '已暂停', stopping: '停止中', success: '已完成', failed: '已失败', cancelled: '已取消' };
 const LESSON_STATUS = { pending: '待下载', downloading: '下载中', success: '成功', failed: '失败' };
 const VIDEO_STATUS = { pending: '待下载', downloading: '下载中', success: '已下载', skipped: '已存在', failed: '失败' };
 
@@ -93,7 +93,7 @@ const app = createApp({
       lessonLoading.value = true;
       try {
         // 走控制台视图接口：同一行同时带网站元数据 + 本地下载对比字段
-        const q = new URLSearchParams({ page: lessonQuery.page, page_size: lessonQuery.page_size, keyword: lessonQuery.keyword, download_state: lessonQuery.download_state });
+        const q = new URLSearchParams({ page: lessonQuery.page, page_size: lessonQuery.page_size, keyword: lessonQuery.keyword, download_state: lessonQuery.download_state, order: 'desc' });
         const data = await api('/api/console/lessons?' + q);
         lessons.value = data.items;
         lessonQuery.total = data.total;
@@ -304,12 +304,21 @@ const app = createApp({
     }
 
     async function retryVideo(row) {
-      const task = await api(`/api/videos/${row.id}/retry`, { method: 'POST' });
-      ElementPlus.ElMessage.success(`已启动课堂重试任务 #${task.id}`);
-      loadVideos(videoQuery.page);
-      loadLessonVideos(row.lesson_id);
-      loadTasks(1);
-      loadStats();
+      const r = await api(`/api/videos/${row.id}/retry-segment`, { method: 'POST' });
+      ElementPlus.ElMessage.success(`已开始重试片段：${r.title || row.title || ''}`);
+      // 后台下载，不占任务队列：每 5 秒刷新该课堂片段，直到不再有下载中
+      let tries = 0;
+      const timer = setInterval(async () => {
+        tries += 1;
+        try {
+          if (view.value !== 'videos') { clearInterval(timer); return; }
+          const q = new URLSearchParams({ page: 1, page_size: 200, lesson_id: row.lesson_id });
+          const data = await api('/api/videos?' + q);
+          lessonVideos[row.lesson_id] = data.items;
+          const busy = (data.items || []).some(v => v.status === 'downloading');
+          if (!busy || tries >= 120) { clearInterval(timer); loadVideos(videoQuery.page); }
+        } catch (e) { clearInterval(timer); }
+      }, 5000);
     }
 
     /* ===== 任务 ===== */
@@ -357,7 +366,11 @@ const app = createApp({
         const t = await api(`/api/tasks/${row.id}/${action}`, { method: 'POST' });
         Object.assign(row, t);
         if (detail.task.id === row.id) Object.assign(detail.task, t);
-        ElementPlus.ElMessage.success(`已${zh}`);
+        if (action === 'start' && t.status === 'queued') {
+          ElementPlus.ElMessage.success('已有任务在运行，已加入队列');
+        } else {
+          ElementPlus.ElMessage.success(`已${zh}`);
+        }
         if (action === 'start') { loadLessons(); loadStats(); }
         if (action === 'stop') loadStats();
         schedulePoll();
@@ -472,7 +485,7 @@ const app = createApp({
       cookieCheckMsg.value = '';
       try {
         const r = await api('/api/settings/verify-cookie', { method: 'POST', body: JSON.stringify({ cookie: settingsForm.cookie.trim() || null }) });
-        cookieCheckMsg.value = (r.valid ? '✅ ' : '❌ ') + r.message;
+        cookieCheckMsg.value = (r.valid ? '验证通过：' : '验证失败：') + r.message;
         cookieCheckClass.value = r.valid ? 'hint ok' : 'hint bad';
       } finally { verifying.value = false; }
     }
@@ -524,7 +537,7 @@ const app = createApp({
       if (!force && courseLessons[key]) return;
       courseLessonLoading[key] = true;
       try {
-        const q = new URLSearchParams({ class_id: key, page: 1, page_size: 200 });
+        const q = new URLSearchParams({ class_id: key, page: 1, page_size: 200, order: 'asc' });
         const data = await api('/api/console/lessons?' + q);
         courseLessons[key] = data.items;
       } finally { courseLessonLoading[key] = false; }
@@ -621,7 +634,7 @@ const app = createApp({
       try {
         // 验证顺序由后端决定：草稿 → 同步专用 → 下载回退（不填即验当前生效的）
         const r = await api('/api/sync/verify-cookie', { method: 'POST', body: JSON.stringify({ cookie: syncForm.cookie.trim() || null }) });
-        syncCheckMsg.value = (r.valid ? '✅ ' : '❌ ') + r.message;
+        syncCheckMsg.value = (r.valid ? '验证通过：' : '验证失败：') + r.message;
         syncCheckClass.value = r.valid ? 'hint ok' : 'hint bad';
       } finally { syncVerifying.value = false; }
     }
@@ -685,7 +698,7 @@ const app = createApp({
     function switchSync() { view.value = 'sync'; loadSync(); loadCourses(1); }
 
     function statusZh(s) { return TASK_STATUS[s] || s; }
-    function statusTag(s) { return { created: 'info', running: '', paused: 'warning', stopping: 'warning', success: 'success', failed: 'danger', cancelled: 'info' }[s] || 'info'; }
+    function statusTag(s) { return { created: 'info', queued: 'warning', running: '', paused: 'warning', stopping: 'warning', success: 'success', failed: 'danger', cancelled: 'info' }[s] || 'info'; }
     function lessonStatusZh(s) { return LESSON_STATUS[s] || s || '待下载'; }
     function lessonStatusTag(s) { return { pending: 'info', downloading: '', success: 'success', failed: 'danger' }[s] || 'info'; }
     function fmtTime(iso) { return iso ? iso.replace('T', ' ').slice(0, 19) : ''; }

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ClassIn 视频下载管理系统</title>
   <link rel="stylesheet" href="/static/vendor/element-plus.css">
-  <link rel="stylesheet" href="/static/styles.css?v=20261019-video-library">
+  <link rel="stylesheet" href="/static/styles.css?v=20261019-longname">
 </head>
 <body>
 <div id="app" v-cloak>
@@ -30,14 +30,14 @@
   <!-- ===== 主框架 ===== -->
   <div class="layout" v-else>
     <aside class="side">
-      <div class="side-logo">📥 ClassIn 下载管理</div>
+      <div class="side-logo">ClassIn <span>视频管理</span></div>
       <div class="side-menu">
-        <div class="side-item" :class="{on: view==='dashboard'}" @click="view='dashboard'">📊 仪表盘</div>
-                <div class="side-item" :class="{on: view==='sync'}" @click="switchSync">🏫 班级同步</div>
-        <div class="side-item" :class="{on: view==='lessons'}" @click="switchLessons">📚 课堂管理</div>
-        <div class="side-item" :class="{on: view==='tasks'}" @click="switchTasks">🎬 下载任务</div>
-        <div class="side-item" :class="{on: view==='videos'}" @click="switchVideos">▶️ 视频库</div>
-        <div class="side-item" :class="{on: view==='settings'}" @click="view='settings'">⚙️ 系统设置</div>
+        <div class="side-item" :class="{on: view==='dashboard'}" @click="view='dashboard'">仪表盘</div>
+        <div class="side-item" :class="{on: view==='sync'}" @click="switchSync">班级同步</div>
+        <div class="side-item" :class="{on: view==='lessons'}" @click="switchLessons">课堂管理</div>
+        <div class="side-item" :class="{on: view==='tasks'}" @click="switchTasks">下载任务</div>
+        <div class="side-item" :class="{on: view==='videos'}" @click="switchVideos">视频库</div>
+        <div class="side-item" :class="{on: view==='settings'}" @click="view='settings'">系统设置</div>
       </div>
       <div class="side-foot">v1.0 前后端一体版</div>
     </aside>
@@ -47,7 +47,7 @@
         <div class="page-title">{{ viewTitle }}</div>
         <div class="user-area">
           <el-dropdown @command="onUserCmd">
-            <span class="user-name">👤 {{ user.username }} <el-icon><ArrowDown /></el-icon></span>
+            <span class="user-name">{{ user.username }} <el-icon><ArrowDown /></el-icon></span>
             <template #dropdown>
               <el-dropdown-menu>
                 <el-dropdown-item command="password">修改密码</el-dropdown-item>
@@ -109,7 +109,7 @@
               <el-button type="warning" :disabled="!selectedLessons.length" @click="createTaskFromSelection">从所选建任务</el-button>
             </div>
             <div class="sub-text mt12" v-if="syncStatus.last_sync_status==='failed' && cookieExpired">
-              ⚠️ 上次同步失败，Cookie 可能已过期：请重新登录 ClassIn 控制台后到【系统设置】更新 Cookie。
+              上次同步失败，Cookie 可能已过期：请重新登录 ClassIn 控制台后到【系统设置】更新 Cookie。
             </div>
           </el-card>
 
@@ -240,6 +240,7 @@
               <el-table-column label="班级" min-width="300">
                 <template #default="{row}"><div class="video-class-cell"><span class="video-class-mark">班</span><div class="video-class-copy"><div class="video-class-name">{{ row.class_name }}</div><div class="video-lesson-name">班级 ID：{{ row.class_id || '未提供' }}</div></div></div></template>
               </el-table-column>
+              <el-table-column prop="last_start_time" label="开课时间" width="160"></el-table-column>
               <el-table-column prop="lesson_count" label="课堂" width="105"><template #default="{row}"><strong class="video-count">{{ row.lesson_count }}</strong><span class="video-unit">堂</span></template></el-table-column>
               <el-table-column prop="video_count" label="视频片段" width="120"><template #default="{row}"><strong class="video-count">{{ row.video_count }}</strong><span class="video-unit">段</span></template></el-table-column>
               <el-table-column label="完成进度" min-width="180"><template #default="{row}"><div class="video-progress-cell"><span>{{ row.ready_count }} / {{ row.video_count }}</span><el-progress :percentage="row.video_count ? Math.round(row.ready_count * 100 / row.video_count) : 0" :show-text="false" :stroke-width="6" status="success" /></div></template></el-table-column>
@@ -304,10 +305,11 @@
               <el-table-column label="操作" width="300" fixed="right">
                 <template #default="{row}">
                   <template v-if="row.status==='created' || row.status==='failed' || row.status==='cancelled' || row.status==='success'">
-                    <el-button link type="primary" @click="taskAction(row,'start')">▶ 启动</el-button>
+                    <el-button link type="primary" @click="taskAction(row,'start')">启动</el-button>
                   </template>
+                  <el-button v-if="row.status==='queued'" link type="warning" @click="taskAction(row,'stop')">取消排队</el-button>
                   <el-button v-if="row.status==='running'" link type="warning" @click="taskAction(row,'pause')">⏸ 暂停</el-button>
-                  <el-button v-if="row.status==='paused'" link type="success" @click="taskAction(row,'resume')">▶ 继续</el-button>
+                  <el-button v-if="row.status==='paused'" link type="success" @click="taskAction(row,'resume')">继续</el-button>
                   <el-button v-if="row.status==='running'||row.status==='paused'" link type="danger" @click="taskAction(row,'stop')">⏹ 停止</el-button>
                   <el-button link type="info" @click="openTaskDetail(row)">详情</el-button>
                   <el-button link type="danger" @click="deleteTask(row)">删除</el-button>
@@ -434,7 +436,7 @@
                 <el-button type="primary" @click="saveSettings">保存配置</el-button>
                 <el-button @click="loadEngine">检测浏览器环境</el-button>
                 <span class="hint" v-if="engineInfo.browser">
-                  浏览器: {{ engineInfo.browser }} {{ engineInfo.driver_ready ? '✅ 驱动就绪' : '⚠️ 未找到驱动' }}
+                  浏览器：{{ engineInfo.browser }} {{ engineInfo.driver_ready ? '驱动就绪' : '未找到驱动' }}
                 </span>
               </el-form-item>
             </el-form>
@@ -577,7 +579,7 @@
 
       <!-- 失败课堂汇总：打开任务详情即置顶展示，不用再翻日志找原因 -->
       <div v-if="failedItems.length" class="fail-panel mb12">
-        <div class="fail-panel-title">❌ 失败课堂 {{ failedItems.length }} 个（错误原因如下）</div>
+        <div class="fail-panel-title">失败课堂 {{ failedItems.length }} 个</div>
         <div v-for="it in failedItems" :key="it.id" class="fail-line">
           <b>{{ it.class_name || it.class_id || '未命名班级' }}</b> · {{ it.lesson_name || it.lesson_id }}：<span>{{ it.message || '引擎未返回具体原因，详见「运行日志」' }}</span>
         </div>
@@ -632,6 +634,6 @@
 <script src="/static/vendor/vue.global.prod.js"></script>
 <script src="/static/vendor/element-plus.min.js"></script>
 <script src="/static/vendor/element-icons.js"></script>
-<script src="/static/app.js?v=20261016-filters"></script>
+<script src="/static/app.js?v=20261019-queue"></script>
 </body>
 </html>

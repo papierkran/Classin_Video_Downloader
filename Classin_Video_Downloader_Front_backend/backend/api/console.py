@@ -46,13 +46,15 @@ def list_console_lessons(
     keyword: str = "",
     download_state: str = "",
     class_id: str = "",
+    order: str = Query(default="desc", pattern="^(asc|desc)$", description="按开课时间排序：desc=最新在上，asc=最老在上"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
     _: User = Depends(current_user),
     db: Session = Depends(db_session),
 ):
-    """课堂列表 + 本地下载对比字段。class_id 供班级展开（取该班全部课堂）。"""
-    total, items = CourseService(db).list_lessons(page, page_size, keyword=keyword, download_state=download_state, class_id=class_id)
+    """课堂列表 + 本地下载对比字段。class_id 供班级展开（取该班全部课堂）；
+    order 区分课堂管理页(desc)与班级同步展开(asc)的相反排序诉求。"""
+    total, items = CourseService(db).list_lessons(page, page_size, keyword=keyword, download_state=download_state, class_id=class_id, order=order)
     return PageOut(total=total, page=page, page_size=page_size, items=[i.model_dump() for i in items])
 
 

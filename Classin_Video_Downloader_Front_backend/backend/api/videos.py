@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import mimetypes
 import os
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_from_bytes
 
@@ -31,6 +32,7 @@ from ..core.fsutil import fs_path
 from ..core.security import create_media_token, decode_media_token
 from ..db.models import AppSetting, DownloadTask, Lesson, User, VideoAsset
 from ..schemas import MediaTicketOut, PageOut, TaskCreateIn, TaskOut, VideoOut
+from ..services.segment_service import start_segment_retry
 from ..services.task_service import ACTIVE, TaskService, scan_existing_video_files
 from .deps import current_user, db_session
 
@@ -92,6 +94,8 @@ def list_video_classes(
         func.coalesce(func.sum(case((VideoAsset.status.in_(("success", "skipped")), 1), else_=0)), 0).label("ready_count"),
         func.coalesce(func.sum(case((VideoAsset.status == "failed", 1), else_=0)), 0).label("failed_count"),
         func.coalesce(func.sum(VideoAsset.size_bytes), 0).label("size_bytes"),
+        # 班级"开课时间"取该班最近一节课的时间（epoch），用于列表展示与排序
+        func.max(Lesson.start_ts).label("last_start_ts"),
     ).outerjoin(VideoAsset, VideoAsset.lesson_id == Lesson.lesson_id).group_by(class_group)
     if keyword.strip():
         pattern = f"%{keyword.strip()}%"
@@ -121,14 +125,18 @@ def list_video_classes(
     # "只取分组键"的子查询再 count——条件一致，总数与翻页口径永远对齐。
     grouped = stmt.with_only_columns(class_group).group_by(class_group).subquery()
     total = db.scalar(select(func.count()).select_from(grouped)) or 0
-    rows = db.execute(stmt.order_by(func.max(Lesson.class_name), func.max(Lesson.class_id)).offset((page - 1) * page_size).limit(page_size)).all()
+    # 开课时间越新越靠前；无时间的班级（历史数据）排最后
+    rows = db.execute(stmt.order_by(
+        func.max(Lesson.start_ts).desc(), func.max(Lesson.class_name), func.max(Lesson.class_id),
+    ).offset((page - 1) * page_size).limit(page_size)).all()
     items = []
     for row in rows:
-        class_id, class_name, lesson_count, video_count, ready_count, failed_count, size_bytes = row
+        class_id, class_name, lesson_count, video_count, ready_count, failed_count, size_bytes, last_start_ts = row
         class_id = class_id or ""
         class_name = class_name or "未命名班级"
         items.append({
             "class_key": class_id or f"name:{class_name}", "class_id": class_id, "class_name": class_name,
+            "last_start_time": datetime.fromtimestamp(last_start_ts).strftime("%Y-%m-%d %H:%M") if last_start_ts else "",
             "lesson_count": int(lesson_count or 0), "video_count": int(video_count or 0),
             "ready_count": int(ready_count or 0), "failed_count": int(failed_count or 0),
             "size_bytes": int(size_bytes or 0),
@@ -182,7 +190,11 @@ def list_class_video_lessons(
                       func.coalesce(func.sum(case((VideoAsset.status == "failed", 1), else_=0)), 0),
                       func.coalesce(func.sum(VideoAsset.size_bytes), 0)) \
             .outerjoin(VideoAsset, VideoAsset.lesson_id == Lesson.lesson_id).where(Lesson.class_id == class_key)
-    rows = db.execute(stmt.group_by(Lesson.id).order_by(Lesson.start_time.desc(), Lesson.lesson_name)).all()
+    # 与班级同步/课堂管理一致：按开课时间升序（最新在最下方）。
+    # start_time 是未补零字符串，不能直接排序，用 start_ts(epoch)。
+    rows = db.execute(stmt.group_by(Lesson.id).order_by(
+        Lesson.start_ts.is_(None), Lesson.start_ts.asc(), Lesson.start_time.asc(), Lesson.id.asc(),
+    )).all()
     return [{
         "id": lesson.id, "lesson_id": lesson.lesson_id, "lesson_name": lesson.lesson_name or "未命名课堂",
         "start_time": lesson.start_time or "", "video_count": int(video_count or 0),
@@ -263,6 +275,12 @@ def create_play_ticket(video_id: int, request: Request, response: Response, _: U
     return MediaTicketOut(url=f"/api/videos/{video_id}/media", expires_in=900)
 
 
+@router.post("/{video_id}/retry-segment")
+def retry_video_segment(video_id: int, _: User = Depends(current_user), db: Session = Depends(db_session)):
+    """单片段重试：只补下这一个失败片段（不建任务、不启动浏览器）。"""
+    return start_segment_retry(db, video_id)
+
+
 @router.get("/{video_id}/media")
 def stream_video(video_id: int, request: Request, download: bool = False, db: Session = Depends(db_session)):
     """按 HTTP Range 流式下发视频（播放与下载共用一个端点）。
@@ -340,13 +358,11 @@ def stream_video(video_id: int, request: Request, download: bool = False, db: Se
 
 @router.post("/{video_id}/retry", response_model=TaskOut)
 def retry_video(video_id: int, _: User = Depends(current_user), db: Session = Depends(db_session)):
-    """为失败视频所属课堂建"重试任务"并直接启动。
+    """为失败视频所属课堂建"整课重试任务"并启动；任务繁忙时自动排队。
 
-    Why 整课重试而不是单片段重试：引擎的最小抓取单位是课堂（一次打开
-    页面列出该课全部片段），做片段级重试要在引擎里开洞；配合
-    skip_existing，重跑不会重复下载已完成的片段，代价只是多列一遍清单。
-    目录沿用该视频上次任务（previous_task）的保存位置：用户当初把任务
-    放到了别的盘，重试文件也该回原来的地方。
+    单片段可用 `/retry-segment`（不建任务）；整课重试走任务体系，配合
+    skip_existing 不会重复下载已完成片段。目录沿用该视频上次任务的保存
+    位置：用户当初把任务放到了别的盘，重试文件也该回原来的地方。
     """
     asset = db.get(VideoAsset, video_id)
     if not asset:
@@ -354,8 +370,6 @@ def retry_video(video_id: int, _: User = Depends(current_user), db: Session = De
     lesson = db.scalars(select(Lesson).where(Lesson.lesson_id == asset.lesson_id)).first()
     if not lesson:
         raise NotFoundError("对应课堂已从课堂库删除，无法重试")
-    if db.scalars(select(DownloadTask).where(DownloadTask.status.in_(ACTIVE))).first():
-        raise ConflictError("已有下载任务运行，请结束后再重试")
     previous_task = db.get(DownloadTask, asset.task_id) if asset.task_id else None
     saved = db.get(AppSetting, 1)
     if not saved or not saved.cookie.strip():

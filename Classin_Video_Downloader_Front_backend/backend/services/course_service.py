@@ -359,7 +359,7 @@ class CourseService:
         rows = list(self.db.scalars(stmt.order_by(Course.first_class_begin_time.desc(), Course.id.desc()).offset((page - 1) * page_size).limit(page_size)).all())
         return total, rows
 
-    def list_lessons(self, page: int, page_size: int, keyword: str = "", download_state: str = "", class_id: str = "") -> tuple[int, list[LessonConsoleOut]]:
+    def list_lessons(self, page: int, page_size: int, keyword: str = "", download_state: str = "", class_id: str = "", order: str = "desc") -> tuple[int, list[LessonConsoleOut]]:
         """课堂列表 + 本地下载对比。
 
         download_state 依赖 VideoAsset 聚合，必须在 SQL 侧按整表过滤后再分页
@@ -395,7 +395,14 @@ class CourseService:
         elif download_state == "partial":
             stmt = stmt.where(ok_c > 0, fail_c > 0)
         total = self.db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-        lessons = list(self.db.scalars(stmt.order_by(Lesson.start_time.desc(), Lesson.id.desc()).offset((page - 1) * page_size).limit(page_size)).all())
+        # 同一接口两处消费方排序诉求相反：课堂管理页要"最新在上"(desc)，
+        # 班级同步的班级展开要"最老在上"(asc)。start_time 未补零，统一用
+        # start_ts 排；is_(None) 升序把无时间的旧数据固定放到最后。
+        if order == "asc":
+            order_by = (Lesson.start_ts.is_(None), Lesson.start_ts.asc(), Lesson.start_time.asc(), Lesson.id.asc())
+        else:
+            order_by = (Lesson.start_ts.is_(None), Lesson.start_ts.desc(), Lesson.start_time.desc(), Lesson.id.desc())
+        lessons = list(self.db.scalars(stmt.order_by(*order_by).offset((page - 1) * page_size).limit(page_size)).all())
         agg_map = self._local_agg([lesson.lesson_id for lesson in lessons])
         items = [self._to_console_out(lesson, *agg_map.get(lesson.lesson_id, (0, 0, 0, None))) for lesson in lessons]
         return total, items

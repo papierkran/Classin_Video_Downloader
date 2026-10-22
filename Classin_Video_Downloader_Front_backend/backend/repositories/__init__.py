@@ -34,8 +34,10 @@ class LessonRepo(BaseRepository[Lesson]):
         if keyword:
             like = f"%{keyword}%"
             stmt = stmt.where(Lesson.lesson_name.like(like) | Lesson.class_name.like(like) | Lesson.lesson_id.like(like))
-        # 默认按开课时间倒序：用户最关心最近的课
-        return stmt.order_by(Lesson.start_time.desc(), Lesson.id.desc())
+        # 课堂管理页保持"最近开课在最上方"（倒序）。Why 用 start_ts 而非
+        # start_time：start_time 是未补零的展示字符串（如 2025/6/7、2026/1/2），
+        # 字符串排序会把 6/29 排到 6/7 前、1/2 排到 1/17 前，看起来乱序。
+        return stmt.order_by(Lesson.start_ts.is_(None), Lesson.start_ts.desc(), Lesson.start_time.desc(), Lesson.id.desc())
 
     def list_by_ids(self, ids: list[int]) -> list[Lesson]:
         """IN 查询一次取回（Why 不循环 get：N 次往返即使走索引也慢）。"""
@@ -44,7 +46,7 @@ class LessonRepo(BaseRepository[Lesson]):
     def list_all(self) -> list[Lesson]:
         """全量列表（lesson_ids 未指定时创建"全部课堂"任务用）。
         课堂量级上限数千，一次性装载可接受；真正的瓶颈始终在下载本身。"""
-        return list(self.db.scalars(select(Lesson).order_by(Lesson.start_time.desc())).all())
+        return list(self.db.scalars(select(Lesson).order_by(Lesson.start_ts.is_(None), Lesson.start_ts.desc(), Lesson.start_time.desc(), Lesson.id.desc())).all())
 
 
 class TaskRepo(BaseRepository[DownloadTask]):
